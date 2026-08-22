@@ -1,3 +1,4 @@
+pub mod boards;
 pub mod sensor;
 
 #[cfg(test)]
