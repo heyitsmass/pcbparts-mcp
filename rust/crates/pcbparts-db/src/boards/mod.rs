@@ -1,6 +1,6 @@
 //! Boards database: schema + module wiring.
 pub mod search;
-// pub mod detail; // added in Task 6 — commented out to verify Task 4 in isolation
+pub mod detail;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
