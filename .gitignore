@@ -64,6 +64,9 @@ data/wafer/
 # check_scrape_status.py in CI; never committed to avoid no-op deploys)
 data/sensors/_scrape_status.json
 
+# Rust build artifacts
+rust/target/
+
 # Built databases (generated from JSONL at build time)
 data/components.db
 data/components.db-wal
