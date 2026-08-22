@@ -1,3 +1,5 @@
+pub mod sensor;
+
 #[cfg(test)]
 mod smoke_test {
     use rusqlite::Connection;
