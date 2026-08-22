@@ -70,3 +70,117 @@ CREATE VIRTUAL TABLE boards_fts USING fts5(
     tokenize='porter unicode61'
 );
 ";
+
+use rusqlite::Connection;
+use std::path::Path;
+use std::sync::Mutex;
+
+/// Opens an existing boards.db file (built by the offline pipeline).
+///
+/// NOTE: unlike Python's `BoardsDatabase`, this does not build the DB if
+/// missing — `pcbparts-pipeline` (a later migration phase) owns the Rust
+/// builder. `Mutex<Connection>` gives correct concurrent access for now;
+/// the production connection-pooling strategy is decided in the
+/// `pcbparts-server` phase once the async runtime is in place.
+pub struct BoardsDb {
+    conn: Mutex<Connection>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error("boards database not found at {0}")]
+    NotFound(String),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+}
+
+impl BoardsDb {
+    pub fn open(db_path: &Path) -> Result<Self, OpenError> {
+        if !db_path.exists() {
+            return Err(OpenError::NotFound(db_path.display().to_string()));
+        }
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL")?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    pub fn search(
+        &self,
+        query: Option<&str>,
+        component: Option<&str>,
+        tag: Option<&[&str]>,
+        org: Option<&str>,
+        layers: Option<i64>,
+        limit: i64,
+    ) -> search::SearchBoardsResult {
+        let conn = self.conn.lock().unwrap();
+        search::search_boards(&conn, query, component, tag, org, layers, limit)
+    }
+
+    pub fn get_board(
+        &self,
+        slug: &str,
+        include_raw: bool,
+        include_bom: bool,
+        focus: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().unwrap();
+        detail::get_board(&conn, slug, include_raw, include_bom, focus)
+    }
+
+    pub fn get_consensus(&self, ic_name: &str) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().unwrap();
+        detail::get_consensus(&conn, ic_name)
+    }
+
+    pub fn get_tag_consensus(&self, tag: &str) -> Option<serde_json::Value> {
+        let conn = self.conn.lock().unwrap();
+        detail::get_tag_consensus(&conn, tag)
+    }
+
+    pub fn get_stats(&self) -> serde_json::Value {
+        let conn = self.conn.lock().unwrap();
+        search::get_stats(&conn)
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    /// Writes a real on-disk boards.db (schema + one row) and confirms
+    /// `BoardsDb::open` reads it back — proves the production open path
+    /// (as opposed to the in-memory fixtures the unit tests use).
+    #[test]
+    fn opens_real_file_and_searches() {
+        let dir = std::env::temp_dir().join(format!("pcbparts-boards-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("boards.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            // format/org/org_display/description/key_coverage/*_text are never NULL in
+            // real builder output (build_boards_db.py defaults every field with `.get(k, "")`),
+            // so a realistic row sets them all — mirrors get_stats()'s reliance on that invariant.
+            conn.execute(
+                "INSERT INTO boards (slug, name, org, org_display, source, format, description, \
+                 key_coverage, key_ics_text, all_ics_text, component_count, ic_count, net_count) \
+                 VALUES ('x', 'X Board', 'acme', 'Acme', 'acme/x', 'kicad7', '', '', '', '', 1, 0, 0)",
+                [],
+            ).unwrap();
+        }
+
+        let db = BoardsDb::open(&db_path).unwrap();
+        let stats = db.get_stats();
+        assert_eq!(stats["total_boards"], 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_file_errors_clearly() {
+        let missing = Path::new("/nonexistent/path/boards.db");
+        assert!(matches!(BoardsDb::open(missing), Err(OpenError::NotFound(_))));
+    }
+}
