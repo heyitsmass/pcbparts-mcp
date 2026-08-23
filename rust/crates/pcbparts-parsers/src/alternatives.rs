@@ -1,4 +1,5 @@
 use crate::parsers::*;
+use serde_json;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
@@ -302,4 +303,316 @@ pub fn pin_count_specs() -> HashSet<&'static str> {
         "Number of Pins", "Number of Positions", "Number of Positions or Pins",
         "Pin Structure", "Pins Structure",
     ])
+}
+
+fn normalize_pin_count(value: &str) -> String {
+    let value = value.trim();
+    let re_nxm = regex::Regex::new(r"^(\d+)\s*x\s*(\d+)\s*[Pp]?$").unwrap();
+    if let Some(c) = re_nxm.captures(value) {
+        let rows: i64 = c[1].parse().unwrap();
+        let pins_per_row: i64 = c[2].parse().unwrap();
+        return (rows * pins_per_row).to_string();
+    }
+    let re_1xn = regex::Regex::new(r"^1\s*x\s*(\d+)\s*[Pp]?$").unwrap();
+    if let Some(c) = re_1xn.captures(value) {
+        return c[1].to_string();
+    }
+    let re_np = regex::Regex::new(r"^(\d+)\s*[Pp]$").unwrap();
+    if let Some(c) = re_np.captures(value) {
+        return c[1].to_string();
+    }
+    let re_plain = regex::Regex::new(r"^(\d+)$").unwrap();
+    if let Some(c) = re_plain.captures(value) {
+        return c[1].to_string();
+    }
+    value.to_string()
+}
+
+/// Check if two spec values match (for must_match rules).
+pub fn values_match(orig_val: &str, cand_val: &str, spec: &str) -> bool {
+    if spec == "Impedance @ Frequency" {
+        return impedance_at_freq_match(orig_val, cand_val);
+    }
+    if pin_count_specs().contains(spec) {
+        return normalize_pin_count(orig_val) == normalize_pin_count(cand_val);
+    }
+    if string_match_specs().contains(spec) {
+        return orig_val.trim().to_lowercase() == cand_val.trim().to_lowercase();
+    }
+    if let Some(SpecParser::Parser(parser)) = spec_parsers().get(spec) {
+        let orig_parsed = parser(orig_val);
+        let cand_parsed = parser(cand_val);
+        return match (orig_parsed, cand_parsed) {
+            (Some(o), Some(c)) => {
+                if o == 0.0 {
+                    c == 0.0
+                } else {
+                    (o - c).abs() / o.abs() < 0.02
+                }
+            }
+            _ => true,
+        };
+    }
+    orig_val.trim().to_lowercase() == cand_val.trim().to_lowercase()
+}
+
+/// Check if candidate spec meets same_or_better requirement.
+pub fn spec_ok(orig_val: &str, cand_val: &str, spec: &str, direction: Direction) -> bool {
+    let parser = match spec_parsers().get(spec) {
+        Some(SpecParser::Parser(p)) => *p,
+        _ => return true,
+    };
+    let (orig_parsed, cand_parsed) = match (parser(orig_val), parser(cand_val)) {
+        (Some(o), Some(c)) => (o, c),
+        _ => return true,
+    };
+    match direction {
+        Direction::Higher => cand_parsed >= orig_parsed * 0.98,
+        Direction::Lower => cand_parsed <= orig_parsed * 1.02,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VerifyInfo {
+    pub specs_verified: Vec<String>,
+    pub specs_unparseable: Vec<String>,
+}
+
+fn get_spec<'a>(specs: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    specs.get(name).and_then(|v| v.as_str())
+}
+
+/// Check if candidate is a compatible alternative for original.
+/// `original`/`candidate` are `{"specs": {...}}`-shaped values, matching the
+/// component dict shape the search/db layer produces.
+pub fn is_compatible_alternative(original: &serde_json::Value, candidate: &serde_json::Value, subcategory: &str) -> (bool, VerifyInfo) {
+    let rules = match compatibility_rules().remove(subcategory) {
+        Some(r) => r,
+        None => return (true, VerifyInfo::default()),
+    };
+
+    let empty = serde_json::json!({});
+    let orig_specs = original.get("specs").unwrap_or(&empty);
+    let cand_specs = candidate.get("specs").unwrap_or(&empty);
+
+    let mut info = VerifyInfo::default();
+
+    for spec in rules.must_match {
+        let orig_val = get_spec(orig_specs, spec);
+        let cand_val = get_spec(cand_specs, spec);
+        match (orig_val, cand_val) {
+            (Some(o), Some(c)) => {
+                if !values_match(o, c, spec) {
+                    return (false, info);
+                }
+                info.specs_verified.push(spec.to_string());
+            }
+            (Some(_), None) | (None, Some(_)) => info.specs_unparseable.push(spec.to_string()),
+            (None, None) => {}
+        }
+    }
+
+    for (spec, direction) in rules.same_or_better {
+        let orig_val = get_spec(orig_specs, spec);
+        let cand_val = get_spec(cand_specs, spec);
+        match (orig_val, cand_val) {
+            (Some(o), Some(c)) => {
+                if let Some(SpecParser::Parser(parser)) = spec_parsers().get(*spec) {
+                    if parser(o).is_some() && parser(c).is_some() {
+                        if !spec_ok(o, c, spec, *direction) {
+                            return (false, info);
+                        }
+                        info.specs_verified.push(spec.to_string());
+                    } else {
+                        info.specs_unparseable.push(spec.to_string());
+                    }
+                } else {
+                    info.specs_unparseable.push(spec.to_string());
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => info.specs_unparseable.push(spec.to_string()),
+            (None, None) => {}
+        }
+    }
+
+    (true, info)
+}
+
+/// Verify candidate has same primary spec value as original.
+pub fn verify_primary_spec_match(original: &serde_json::Value, candidate: &serde_json::Value, primary_attr: &str) -> bool {
+    let empty = serde_json::json!({});
+    let orig_value = get_spec(original.get("specs").unwrap_or(&empty), primary_attr);
+    let cand_value = get_spec(candidate.get("specs").unwrap_or(&empty), primary_attr);
+    match (orig_value, cand_value) {
+        (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => values_match(o, c, primary_attr),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- TestValuesMatch ---
+    #[test]
+    fn test_resistance_match() {
+        assert!(values_match("10kΩ", "10kΩ", "Resistance"));
+        assert!(values_match("10kΩ", "10K", "Resistance"));
+        assert!(!values_match("10kΩ", "20kΩ", "Resistance"));
+    }
+    #[test]
+    fn test_string_match_spec() {
+        assert!(values_match("X7R", "X7R", "Temperature Coefficient"));
+        assert!(values_match("x7r", "X7R", "Temperature Coefficient"));
+        assert!(!values_match("X7R", "X5R", "Temperature Coefficient"));
+    }
+    #[test]
+    fn test_color_match() {
+        assert!(values_match("Red", "red", "Illumination Color"));
+        assert!(!values_match("Red", "Blue", "Illumination Color"));
+    }
+    #[test]
+    fn test_voltage_match_with_tolerance() {
+        assert!(values_match("25V", "25V", "Voltage Rating"));
+        assert!(values_match("25V", "25.4V", "Voltage Rating"));
+        assert!(!values_match("25V", "30V", "Voltage Rating"));
+    }
+
+    // --- TestSpecOk ---
+    #[test]
+    fn test_higher_is_better() {
+        assert!(spec_ok("25V", "50V", "Voltage Rating", Direction::Higher));
+        assert!(!spec_ok("50V", "25V", "Voltage Rating", Direction::Higher));
+    }
+    #[test]
+    fn test_lower_is_better() {
+        assert!(spec_ok("5%", "1%", "Tolerance", Direction::Lower));
+        assert!(!spec_ok("1%", "5%", "Tolerance", Direction::Lower));
+    }
+    #[test]
+    fn test_tolerance_margin() {
+        assert!(spec_ok("10V", "9.9V", "Voltage Rating", Direction::Higher));
+    }
+
+    // --- TestIsCompatibleAlternative ---
+    #[test]
+    fn test_resistor_compatible() {
+        let original = json!({"specs": {"Resistance": "10kΩ", "Tolerance": "5%", "Power(Watts)": "1/4W"}});
+        let candidate = json!({"specs": {"Resistance": "10kΩ", "Tolerance": "1%", "Power(Watts)": "1/2W"}});
+        let (is_compat, info) = is_compatible_alternative(&original, &candidate, "Chip Resistor - Surface Mount");
+        assert!(is_compat);
+        assert!(info.specs_verified.contains(&"Tolerance".to_string()));
+        assert!(info.specs_verified.contains(&"Power(Watts)".to_string()));
+    }
+    #[test]
+    fn test_resistor_incompatible_tolerance() {
+        let original = json!({"specs": {"Resistance": "10kΩ", "Tolerance": "1%", "Power(Watts)": "1/4W"}});
+        let candidate = json!({"specs": {"Resistance": "10kΩ", "Tolerance": "5%", "Power(Watts)": "1/4W"}});
+        let (is_compat, _) = is_compatible_alternative(&original, &candidate, "Chip Resistor - Surface Mount");
+        assert!(!is_compat);
+    }
+    #[test]
+    fn test_capacitor_must_match_dielectric() {
+        let original = json!({"specs": {"Capacitance": "100nF", "Voltage Rating": "25V", "Temperature Coefficient": "X7R"}});
+        let candidate = json!({"specs": {"Capacitance": "100nF", "Voltage Rating": "50V", "Temperature Coefficient": "X5R"}});
+        let (is_compat, _) = is_compatible_alternative(&original, &candidate, "Multilayer Ceramic Capacitors MLCC - SMD/SMT");
+        assert!(!is_compat);
+    }
+    #[test]
+    fn test_capacitor_compatible_higher_voltage() {
+        let original = json!({"specs": {"Capacitance": "100nF", "Voltage Rating": "25V", "Temperature Coefficient": "X7R", "Tolerance": "10%"}});
+        let candidate = json!({"specs": {"Capacitance": "100nF", "Voltage Rating": "50V", "Temperature Coefficient": "X7R", "Tolerance": "5%"}});
+        let (is_compat, _) = is_compatible_alternative(&original, &candidate, "Multilayer Ceramic Capacitors MLCC - SMD/SMT");
+        assert!(is_compat);
+    }
+    #[test]
+    fn test_led_must_match_color() {
+        let original = json!({"specs": {"Illumination Color": "Red"}});
+        let candidate = json!({"specs": {"Illumination Color": "Blue"}});
+        let (is_compat, _) = is_compatible_alternative(&original, &candidate, "LED Indication - Discrete");
+        assert!(!is_compat);
+    }
+    #[test]
+    fn test_unsupported_category_passes() {
+        let original = json!({"specs": {"Some Spec": "value"}});
+        let candidate = json!({"specs": {"Some Spec": "different"}});
+        let (is_compat, info) = is_compatible_alternative(&original, &candidate, "Unknown Category That Does Not Exist");
+        assert!(is_compat);
+        assert!(info.specs_verified.is_empty());
+    }
+
+    // --- TestVerifyPrimarySpecMatch ---
+    #[test]
+    fn test_verify_resistance_match() {
+        let original = json!({"specs": {"Resistance": "10kΩ"}});
+        let candidate = json!({"specs": {"Resistance": "10kΩ"}});
+        assert!(verify_primary_spec_match(&original, &candidate, "Resistance"));
+    }
+    #[test]
+    fn test_verify_resistance_mismatch() {
+        let original = json!({"specs": {"Resistance": "10kΩ"}});
+        let candidate = json!({"specs": {"Resistance": "20kΩ"}});
+        assert!(!verify_primary_spec_match(&original, &candidate, "Resistance"));
+    }
+    #[test]
+    fn test_verify_missing_spec_passes() {
+        let original = json!({"specs": {"Resistance": "10kΩ"}});
+        let candidate = json!({"specs": {}});
+        assert!(verify_primary_spec_match(&original, &candidate, "Resistance"));
+    }
+
+    // --- TestCompatibilityRulesCoverage ---
+    #[test]
+    fn test_resistors_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("Chip Resistor - Surface Mount"));
+        assert!(rules.contains_key("Through Hole Resistors"));
+    }
+    #[test]
+    fn test_capacitors_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("Multilayer Ceramic Capacitors MLCC - SMD/SMT"));
+        assert!(rules.contains_key("Aluminum Electrolytic Capacitors - SMD"));
+        assert!(rules.contains_key("Tantalum Capacitors"));
+    }
+    #[test]
+    fn test_inductors_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("Inductors (SMD)"));
+        assert!(rules.contains_key("Power Inductors"));
+        assert!(rules.contains_key("Ferrite Beads"));
+    }
+    #[test]
+    fn test_semiconductors_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("MOSFETs"));
+        assert!(rules.contains_key("Bipolar (BJT)"));
+        assert!(rules.contains_key("Schottky Diodes"));
+        assert!(rules.contains_key("Zener Diodes"));
+    }
+    #[test]
+    fn test_leds_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("LED Indication - Discrete"));
+        assert!(rules.contains_key("LED - High Brightness"));
+    }
+    #[test]
+    fn test_timing_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("Crystals"));
+        assert!(rules.contains_key("Crystal Oscillators"));
+    }
+    #[test]
+    fn test_switches_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("Tactile Switches"));
+        assert!(rules.contains_key("Toggle Switches"));
+    }
+    #[test]
+    fn test_connectors_covered() {
+        let rules = compatibility_rules();
+        assert!(rules.contains_key("Pin Headers"));
+        assert!(rules.contains_key("USB Connectors"));
+    }
 }
