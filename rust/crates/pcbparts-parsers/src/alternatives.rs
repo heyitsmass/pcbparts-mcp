@@ -486,7 +486,7 @@ pub fn score_alternative(part: &serde_json::Value, original: &serde_json::Value,
 
     let same_mfr = part.get("manufacturer").and_then(|v| v.as_str())
         == original.get("manufacturer").and_then(|v| v.as_str());
-    if same_mfr && part.get("manufacturer").is_some() {
+    if same_mfr {
         score += 10;
         breakdown.insert("same_manufacturer".to_string(), 10);
     } else {
@@ -703,5 +703,29 @@ mod tests {
         let original = json!({"manufacturer": "Samsung"});
         let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
         assert_eq!(breakdown["same_manufacturer"], 10);
+    }
+
+    // --- TestScoreAlternativePrice ---
+    #[test]
+    fn test_price_missing_field() {
+        let part = json!({"library_type": "extended", "stock": 1000});
+        let original = json!({});
+        let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
+        assert_eq!(breakdown["price"], 0);
+    }
+    #[test]
+    fn test_price_min_price_none() {
+        let part = json!({"library_type": "extended", "stock": 1000, "price": 0.01});
+        let original = json!({});
+        let (_, breakdown) = score_alternative(&part, &original, None);
+        assert_eq!(breakdown["price"], 0);
+    }
+    #[test]
+    fn test_price_fractional_ratio() {
+        // price_ratio = 0.01 / 0.03 = 0.333..., 10 * 0.333 = 3.33, floor = 3
+        let part = json!({"library_type": "extended", "stock": 1000, "price": 0.03});
+        let original = json!({});
+        let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
+        assert_eq!(breakdown["price"], 3);
     }
 }
