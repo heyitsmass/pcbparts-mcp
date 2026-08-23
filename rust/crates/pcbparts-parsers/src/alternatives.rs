@@ -1,5 +1,5 @@
 use crate::parsers::*;
-use serde_json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
@@ -507,6 +507,202 @@ pub fn score_alternative(part: &serde_json::Value, original: &serde_json::Value,
     (score, breakdown)
 }
 
+pub type ScoredAlternative = (i64, Value, HashMap<String, i64>, VerifyInfo);
+
+/// Build the find_alternatives response for a supported subcategory.
+pub fn build_response(
+    original: &Value,
+    scored_alternatives: &[ScoredAlternative],
+    subcategory: &str,
+    primary_attr: Option<&str>,
+    primary_value: Option<&str>,
+    limit: usize,
+) -> Value {
+    let alternatives: Vec<&ScoredAlternative> = scored_alternatives.iter().take(limit).collect();
+
+    let no_fee_count = alternatives
+        .iter()
+        .filter(|(_, p, _, _)| matches!(p.get("library_type").and_then(|v| v.as_str()), Some("basic") | Some("preferred")))
+        .count();
+
+    let all_specs_verified = if alternatives.is_empty() {
+        true
+    } else {
+        alternatives.iter().all(|(_, _, _, v)| v.specs_unparseable.is_empty())
+    };
+    let confidence = if all_specs_verified { "high" } else { "medium" };
+    let confidence_reason = if all_specs_verified {
+        "All critical specs verified compatible"
+    } else {
+        "Some specs could not be parsed - verify manually"
+    };
+
+    let message = if alternatives.is_empty() {
+        if matches!(original.get("library_type").and_then(|v| v.as_str()), Some("basic") | Some("preferred")) {
+            "Original part is already basic/preferred - no assembly fee savings possible".to_string()
+        } else {
+            format!("No compatible alternatives found matching {}", primary_value.unwrap_or(""))
+        }
+    } else if no_fee_count > 0 {
+        format!("Found {no_fee_count} basic/preferred alternative(s) that save $3 assembly fee")
+    } else {
+        format!("Found {} alternative(s), but all are extended library", alternatives.len())
+    };
+
+    let best_part = alternatives.first().map(|(_, p, _, _)| p);
+
+    let (_savings, comparison) = if let Some(best_part) = best_part {
+        let assembly_savings = if original.get("library_type").and_then(|v| v.as_str()) == Some("extended")
+            && matches!(best_part.get("library_type").and_then(|v| v.as_str()), Some("basic") | Some("preferred"))
+        {
+            3.0
+        } else {
+            0.0
+        };
+        let orig_price = original.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let best_price = best_part.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let price_diff = orig_price - best_price;
+        let savings = json!({
+            "assembly_fee": assembly_savings,
+            "unit_price_diff": (price_diff * 10000.0).round() / 10000.0,
+            "total_per_unit": ((assembly_savings + price_diff) * 10000.0).round() / 10000.0,
+        });
+        let comparison = json!({
+            "original": {
+                "lcsc": original.get("lcsc"),
+                "library_type": original.get("library_type"),
+                "price": original.get("price"),
+                "stock": original.get("stock"),
+            },
+            "recommended": {
+                "lcsc": best_part.get("lcsc"),
+                "library_type": best_part.get("library_type"),
+                "price": best_part.get("price"),
+                "stock": best_part.get("stock"),
+            },
+            "savings": savings,
+        });
+        (savings, comparison)
+    } else {
+        (Value::Null, Value::Null)
+    };
+
+    let original_pkg = original.get("package").and_then(|v| v.as_str()).unwrap_or("");
+    let mut alternatives_output = Vec::new();
+    for (score, part, breakdown, verify_info) in &alternatives {
+        let mut alt = part.as_object().cloned().unwrap_or_default();
+        alt.insert("score".to_string(), json!(score));
+        alt.insert("score_breakdown".to_string(), json!(breakdown));
+        alt.insert("specs_verified".to_string(), json!(verify_info.specs_verified));
+        alt.insert("specs_unparseable".to_string(), json!(verify_info.specs_unparseable));
+
+        let moq = part.get("min_order").and_then(|v| v.as_i64()).unwrap_or(1);
+        if moq > 100 {
+            alt.insert("moq_warning".to_string(), json!(format!("High MOQ: {moq} units minimum")));
+        }
+        let part_pkg = part.get("package").and_then(|v| v.as_str()).unwrap_or("");
+        if !original_pkg.is_empty() && !part_pkg.is_empty() && original_pkg != part_pkg {
+            alt.insert(
+                "package_warning".to_string(),
+                json!(format!("Different package: {part_pkg} vs original {original_pkg}")),
+            );
+        }
+        alternatives_output.push(Value::Object(alt));
+    }
+
+    json!({
+        "original": original,
+        "alternatives": alternatives_output,
+        "summary": {
+            "found": alternatives.len(),
+            "basic_preferred_count": no_fee_count,
+            "message": message,
+            "is_supported_category": true,
+            "price_note": "Prices shown are unit price at qty 1 tier",
+        },
+        "comparison": comparison,
+        "confidence": {
+            "level": confidence,
+            "reason": confidence_reason,
+        },
+        "search_criteria": {
+            "primary_attribute": primary_attr,
+            "matched_value": primary_value,
+            "subcategory": subcategory,
+            "compatibility_verified": true,
+        },
+    })
+}
+
+/// Build response for unsupported subcategories — similar parts, not alternatives.
+pub fn build_unsupported_response(
+    original: &Value,
+    scored_parts: &[ScoredAlternative],
+    subcategory: &str,
+    primary_attr: Option<&str>,
+    limit: usize,
+) -> Value {
+    let similar: Vec<&ScoredAlternative> = scored_parts.iter().take(limit).collect();
+
+    let empty = json!({});
+    let specs_to_verify: Vec<String> = original
+        .get("specs")
+        .unwrap_or(&empty)
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let original_pkg = original.get("package").and_then(|v| v.as_str()).unwrap_or("");
+
+    let mut similar_parts_output = Vec::new();
+    for (score, part, breakdown, _) in &similar {
+        let mut item = part.as_object().cloned().unwrap_or_default();
+        item.insert("score".to_string(), json!(score));
+        item.insert("score_breakdown".to_string(), json!(breakdown));
+
+        let moq = part.get("min_order").and_then(|v| v.as_i64()).unwrap_or(1);
+        if moq > 100 {
+            item.insert("moq_warning".to_string(), json!(format!("High MOQ: {moq} units minimum")));
+        }
+        let part_pkg = part.get("package").and_then(|v| v.as_str()).unwrap_or("");
+        if !original_pkg.is_empty() && !part_pkg.is_empty() && original_pkg != part_pkg {
+            item.insert(
+                "package_warning".to_string(),
+                json!(format!("Different package: {part_pkg} vs original {original_pkg}")),
+            );
+        }
+        similar_parts_output.push(Value::Object(item));
+    }
+
+    let primary_value = primary_attr.and_then(|attr| get_spec(original.get("specs").unwrap_or(&empty), attr));
+
+    json!({
+        "original": original,
+        "alternatives": [],
+        "similar_parts": similar_parts_output,
+        "summary": {
+            "found": similar.len(),
+            "message": "No compatibility rules for this category. Showing similar parts for manual comparison.",
+            "is_supported_category": false,
+            "price_note": "Prices shown are unit price at qty 1 tier",
+        },
+        "manual_comparison": {
+            "original_specs": original.get("specs").unwrap_or(&empty),
+            "specs_to_verify": specs_to_verify.iter().take(5).collect::<Vec<_>>(),
+            "guidance": if specs_to_verify.is_empty() {
+                "Review datasheets for compatibility".to_string()
+            } else {
+                format!("Compare these specs manually: {}", specs_to_verify.iter().take(5).cloned().collect::<Vec<_>>().join(", "))
+            },
+        },
+        "search_criteria": {
+            "primary_attribute": primary_attr,
+            "matched_value": primary_value,
+            "subcategory": subcategory,
+            "compatibility_verified": false,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +923,25 @@ mod tests {
         let original = json!({});
         let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
         assert_eq!(breakdown["price"], 3);
+    }
+
+    // --- smoke tests for build_response / build_unsupported_response ---
+    #[test]
+    fn build_response_smoke_test() {
+        let original = json!({"lcsc": "C1", "library_type": "extended", "price": 0.05, "package": "0603", "specs": {"Resistance": "10kΩ"}});
+        let candidate = json!({"lcsc": "C2", "library_type": "basic", "price": 0.02, "package": "0603", "min_order": 1});
+        let scored: Vec<ScoredAlternative> = vec![(1050, candidate, HashMap::from([("library_type".to_string(), 1000)]), VerifyInfo { specs_verified: vec!["Resistance".to_string()], specs_unparseable: vec![] })];
+        let resp = build_response(&original, &scored, "Chip Resistor - Surface Mount", Some("Resistance"), Some("10kΩ"), 5);
+        assert_eq!(resp["summary"]["found"], 1);
+        assert_eq!(resp["summary"]["is_supported_category"], true);
+    }
+    #[test]
+    fn build_unsupported_response_smoke_test() {
+        let original = json!({"lcsc": "C1", "package": "SOT-23", "specs": {"Some Spec": "x"}});
+        let part = json!({"lcsc": "C2", "package": "SOT-23", "min_order": 1});
+        let scored: Vec<ScoredAlternative> = vec![(10, part, HashMap::new(), VerifyInfo::default())];
+        let resp = build_unsupported_response(&original, &scored, "Unknown Category", None, 5);
+        assert_eq!(resp["summary"]["is_supported_category"], false);
+        assert_eq!(resp["similar_parts"].as_array().unwrap().len(), 1);
     }
 }
