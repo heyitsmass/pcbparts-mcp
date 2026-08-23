@@ -453,7 +453,10 @@ pub fn resolve_subcategory_name(
         return None;
     }
 
-    matches.sort_by_key(|(k, _)| k.len());
+    // Sort by length first, then alphabetically for deterministic tie-breaks.
+    // (This doesn't reproduce Python's insertion-order tie-break, but gives a
+    // stable, reproducible result given the HashMap<String, i64> interface.)
+    matches.sort_by_key(|(k, _)| (k.len(), *k));
     Some(matches[0].1)
 }
 
