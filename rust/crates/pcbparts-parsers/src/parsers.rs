@@ -349,7 +349,7 @@ pub fn parse_integer(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    INTEGER_PATTERN.captures(s).map(|c| c[1].parse().unwrap())
+    INTEGER_PATTERN.captures(s).and_then(|c| c[1].parse::<i128>().ok().and_then(|v| i64::try_from(v).ok()))
 }
 
 pub fn parse_vgs_range(s: &str) -> (Option<f64>, Option<f64>) {
@@ -791,5 +791,19 @@ mod tests {
         assert!(impedance_at_freq_match("600Ω @ 100MHz", "606Ω @ 100MHz"));
         assert!(!impedance_at_freq_match("600Ω @ 100MHz", "1200Ω @ 100MHz"));
         assert!(!impedance_at_freq_match("600Ω @ 100MHz", "600Ω @ 200MHz"));
+    }
+
+    #[test]
+    fn parse_integer_overflow_no_panic() {
+        // Normal cases still work
+        assert_eq!(parse_integer("42"), Some(42));
+        assert_eq!(parse_integer("0"), Some(0));
+
+        // Overflow returns None instead of panicking (this was previously a panic)
+        assert_eq!(parse_integer("99999999999999999999"), None);
+        assert_eq!(parse_integer("9223372036854775808"), None); // i64::MAX + 1
+
+        // Edge cases at i64 boundaries
+        assert_eq!(parse_integer("9223372036854775807"), Some(9223372036854775807)); // i64::MAX
     }
 }
