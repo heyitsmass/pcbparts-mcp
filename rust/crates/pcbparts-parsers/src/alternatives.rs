@@ -451,6 +451,62 @@ pub fn verify_primary_spec_match(original: &serde_json::Value, candidate: &serde
     }
 }
 
+/// Score an alternative part for ranking. Returns (total_score, breakdown).
+pub fn score_alternative(part: &serde_json::Value, original: &serde_json::Value, min_price_in_results: Option<f64>) -> (i64, HashMap<String, i64>) {
+    let mut score: i64 = 0;
+    let mut breakdown: HashMap<String, i64> = HashMap::new();
+
+    let lib_type = part.get("library_type").and_then(|v| v.as_str());
+    if matches!(lib_type, Some("basic") | Some("preferred")) {
+        score += 1000;
+        breakdown.insert("library_type".to_string(), 1000);
+    } else {
+        breakdown.insert("library_type".to_string(), 0);
+    }
+
+    let stock = part.get("stock").and_then(|v| v.as_i64()).unwrap_or(0);
+    let avail_score = if stock >= 10000 {
+        70
+    } else if stock >= 1000 {
+        50
+    } else if stock >= 100 {
+        30
+    } else {
+        -10
+    };
+    score += avail_score;
+    breakdown.insert("availability".to_string(), avail_score);
+
+    if part.get("has_easyeda_footprint").and_then(|v| v.as_bool()).unwrap_or(false) {
+        score += 20;
+        breakdown.insert("easyeda".to_string(), 20);
+    } else {
+        breakdown.insert("easyeda".to_string(), 0);
+    }
+
+    let same_mfr = part.get("manufacturer").and_then(|v| v.as_str())
+        == original.get("manufacturer").and_then(|v| v.as_str());
+    if same_mfr && part.get("manufacturer").is_some() {
+        score += 10;
+        breakdown.insert("same_manufacturer".to_string(), 10);
+    } else {
+        breakdown.insert("same_manufacturer".to_string(), 0);
+    }
+
+    let part_price = part.get("price").and_then(|v| v.as_f64());
+    let price_score = match (part_price, min_price_in_results) {
+        (Some(pp), Some(mp)) if pp > 0.0 && mp > 0.0 => {
+            let price_ratio = mp / pp;
+            (10.0 * price_ratio).floor().min(10.0) as i64
+        }
+        _ => 0,
+    };
+    score += price_score;
+    breakdown.insert("price".to_string(), price_score);
+
+    (score, breakdown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +672,36 @@ mod tests {
         let rules = compatibility_rules();
         assert!(rules.contains_key("Pin Headers"));
         assert!(rules.contains_key("USB Connectors"));
+    }
+
+    // --- TestScoreAlternative ---
+    #[test]
+    fn test_basic_library_gets_high_score() {
+        let part = json!({"library_type": "basic", "stock": 10000, "price": 0.01});
+        let original = json!({"manufacturer": "Other"});
+        let (score, breakdown) = score_alternative(&part, &original, Some(0.01));
+        assert_eq!(breakdown["library_type"], 1000);
+        assert!(score >= 1000);
+    }
+    #[test]
+    fn test_extended_library_low_score() {
+        let part = json!({"library_type": "extended", "stock": 10000, "price": 0.01});
+        let original = json!({"manufacturer": "Other"});
+        let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
+        assert_eq!(breakdown["library_type"], 0);
+    }
+    #[test]
+    fn test_high_stock_bonus() {
+        let part = json!({"library_type": "extended", "stock": 50000, "price": 0.01});
+        let original = json!({"manufacturer": "Other"});
+        let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
+        assert_eq!(breakdown["availability"], 70);
+    }
+    #[test]
+    fn test_same_manufacturer_bonus() {
+        let part = json!({"library_type": "extended", "stock": 1000, "price": 0.01, "manufacturer": "Samsung"});
+        let original = json!({"manufacturer": "Samsung"});
+        let (_, breakdown) = score_alternative(&part, &original, Some(0.01));
+        assert_eq!(breakdown["same_manufacturer"], 10);
     }
 }
