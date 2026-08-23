@@ -401,12 +401,13 @@ pub fn is_compatible_alternative(original: &serde_json::Value, candidate: &serde
         let orig_val = get_spec(orig_specs, spec);
         let cand_val = get_spec(cand_specs, spec);
         match (orig_val, cand_val) {
-            (Some(o), Some(c)) => {
+            (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => {
                 if !values_match(o, c, spec) {
                     return (false, info);
                 }
                 info.specs_verified.push(spec.to_string());
             }
+            (Some(_), Some(_)) => info.specs_unparseable.push(spec.to_string()),
             (Some(_), None) | (None, Some(_)) => info.specs_unparseable.push(spec.to_string()),
             (None, None) => {}
         }
@@ -416,7 +417,7 @@ pub fn is_compatible_alternative(original: &serde_json::Value, candidate: &serde
         let orig_val = get_spec(orig_specs, spec);
         let cand_val = get_spec(cand_specs, spec);
         match (orig_val, cand_val) {
-            (Some(o), Some(c)) => {
+            (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => {
                 if let Some(SpecParser::Parser(parser)) = spec_parsers().get(*spec) {
                     if parser(o).is_some() && parser(c).is_some() {
                         if !spec_ok(o, c, spec, *direction) {
@@ -430,6 +431,7 @@ pub fn is_compatible_alternative(original: &serde_json::Value, candidate: &serde
                     info.specs_unparseable.push(spec.to_string());
                 }
             }
+            (Some(_), Some(_)) => info.specs_unparseable.push(spec.to_string()),
             (Some(_), None) | (None, Some(_)) => info.specs_unparseable.push(spec.to_string()),
             (None, None) => {}
         }
