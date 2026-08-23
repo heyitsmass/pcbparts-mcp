@@ -309,9 +309,22 @@ fn normalize_pin_count(value: &str) -> String {
     let value = value.trim();
     let re_nxm = regex::Regex::new(r"^(\d+)\s*x\s*(\d+)\s*[Pp]?$").unwrap();
     if let Some(c) = re_nxm.captures(value) {
-        let rows: i64 = c[1].parse().unwrap();
-        let pins_per_row: i64 = c[2].parse().unwrap();
-        return (rows * pins_per_row).to_string();
+        // Safe parsing: use i128 to avoid overflow panic, then check i64 bounds
+        if let (Ok(rows_i128), Ok(pins_per_row_i128)) = (
+            c[1].parse::<i128>(),
+            c[2].parse::<i128>(),
+        ) {
+            if let (Ok(rows), Ok(pins_per_row)) = (
+                i64::try_from(rows_i128),
+                i64::try_from(pins_per_row_i128),
+            ) {
+                if let Some(product) = rows.checked_mul(pins_per_row) {
+                    return product.to_string();
+                }
+            }
+        }
+        // If overflow occurs, return original unmodified value (matching fallback behavior)
+        return value.to_string();
     }
     let re_1xn = regex::Regex::new(r"^1\s*x\s*(\d+)\s*[Pp]?$").unwrap();
     if let Some(c) = re_1xn.captures(value) {
@@ -731,6 +744,18 @@ mod tests {
         assert!(values_match("25V", "25V", "Voltage Rating"));
         assert!(values_match("25V", "25.4V", "Voltage Rating"));
         assert!(!values_match("25V", "30V", "Voltage Rating"));
+    }
+    #[test]
+    fn test_normalize_pin_count_overflow_no_panic() {
+        // Normal cases still work
+        assert_eq!(normalize_pin_count("2x5"), "10");
+        assert_eq!(normalize_pin_count("10x10"), "100");
+
+        // Overflow returns original string instead of panicking (matches fallback behavior)
+        // 19+ digit number overflows i64
+        assert_eq!(normalize_pin_count("99999999999999999999x2"), "99999999999999999999x2");
+        // Multiply overflow case
+        assert_eq!(normalize_pin_count("9223372036854775807x2"), "9223372036854775807x2");
     }
 
     // --- TestSpecOk ---
