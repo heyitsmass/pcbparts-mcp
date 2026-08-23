@@ -541,7 +541,7 @@ pub fn build_response(
         if matches!(original.get("library_type").and_then(|v| v.as_str()), Some("basic") | Some("preferred")) {
             "Original part is already basic/preferred - no assembly fee savings possible".to_string()
         } else {
-            format!("No compatible alternatives found matching {}", primary_value.unwrap_or(""))
+            format!("No compatible alternatives found matching {}", primary_value.unwrap_or("None"))
         }
     } else if no_fee_count > 0 {
         format!("Found {no_fee_count} basic/preferred alternative(s) that save $3 assembly fee")
