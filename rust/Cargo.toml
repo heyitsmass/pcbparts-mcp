@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/pcbparts-db", "crates/pcbparts-parsers"]
+members = ["crates/pcbparts-db", "crates/pcbparts-parsers", "crates/pcbparts-search"]
