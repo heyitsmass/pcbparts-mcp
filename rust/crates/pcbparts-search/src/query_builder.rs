@@ -439,11 +439,9 @@ pub fn needs_numeric_post_filter(spec_filter: &SpecFilter) -> bool {
         for name in &attr_names {
             match parsers.get(name.as_str()) {
                 Some(SpecParser::Parser(_)) => return true,
-                Some(SpecParser::Special) => {
-                    panic!(
-                        "'{name}' spec parser is 'special' (non-callable) — Python's needs_numeric_post_filter returns True here since SPEC_PARSERS[name] is truthy; preserved faithfully per this plan's Task 4 instruction, not fixed here"
-                    );
-                }
+                // Python only checks SPEC_PARSERS.get(name) for truthiness, never calls the parser.
+                // "special" is a truthy string, so Python returns True here (no crash).
+                Some(SpecParser::Special) => return true,
                 Some(SpecParser::StringMatch) => {}
                 None => {}
             }
@@ -667,5 +665,13 @@ mod tests {
         assert!(!needs_numeric_post_filter(&SpecFilter::new("Resistance", ">=", "10k").unwrap()));
         assert!(!needs_numeric_post_filter(&SpecFilter::new("Type", "=", "N-Channel").unwrap()));
         assert!(needs_numeric_post_filter(&SpecFilter::new("Vgs(th)", "=", "2V").unwrap()));
+    }
+
+    #[test]
+    fn test_needs_numeric_post_filter_impedance_at_frequency_special_parser() {
+        // "Impedance @ Frequency" has SpecParser::Special (non-callable marker in Python).
+        // Python only checks truthiness, never calls the parser, so it returns True.
+        // This test verifies the Rust implementation matches Python's behavior.
+        assert!(needs_numeric_post_filter(&SpecFilter::new("Impedance @ Frequency", "=", "50Ω").unwrap()));
     }
 }
