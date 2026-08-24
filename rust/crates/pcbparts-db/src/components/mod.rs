@@ -132,6 +132,35 @@ impl ComponentsDb {
         let conn = self.conn.lock().unwrap();
         lookup::get_by_lcsc_batch(&conn, lcsc_codes, &self.subcategories)
     }
+
+    pub fn get_subcategory_name(&self, subcategory_id: i64) -> Option<String> {
+        categories::get_subcategory_name(subcategory_id, &self.subcategories)
+    }
+
+    pub fn get_category_for_subcategory(&self, subcategory_id: i64) -> Option<(i64, Option<String>)> {
+        categories::get_category_for_subcategory(subcategory_id, &self.subcategories)
+    }
+
+    pub fn get_categories_for_client(&self) -> Vec<Value> {
+        let conn = self.conn.lock().unwrap();
+        categories::get_categories_for_client(&conn, &self.subcategories)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_by_subcategory(
+        &self,
+        subcategory_id: i64,
+        primary_spec: Option<&str>,
+        primary_value: Option<&str>,
+        min_stock: i64,
+        library_type: Option<&str>,
+        prefer_no_fee: bool,
+        limit: i64,
+    ) -> Vec<Value> {
+        let conn = self.conn.lock().unwrap();
+        let min_stock = min_stock.max(DEFAULT_MIN_STOCK);
+        categories::find_by_subcategory(&conn, &self.subcategories, subcategory_id, primary_spec, primary_value, min_stock, library_type, prefer_no_fee, limit)
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +399,44 @@ mod tests {
             for field in ["lcsc", "model", "manufacturer", "package", "stock", "price", "library_type", "specs"] {
                 assert!(part.get(field).is_some(), "missing field '{field}'");
             }
+        }
+    }
+
+    // --- TestCategoriesClient ---
+    #[test]
+    fn get_categories_for_client_smoke_test() {
+        let db = real_db();
+        let categories = db.get_categories_for_client();
+        assert!(!categories.is_empty(), "should list at least one category with parts");
+        let first = &categories[0];
+        assert!(first.get("id").is_some());
+        assert!(first.get("name").is_some());
+        assert!(first.get("subcategories").is_some());
+    }
+
+    // --- TestFindBySubcategory ---
+    #[test]
+    fn find_by_subcategory_smoke_test() {
+        let db = real_db();
+        let mosfet_id = db.resolve_subcategory_name("MOSFETs").unwrap();
+        let results = db.find_by_subcategory(mosfet_id, None, None, 10, None, true, 5);
+        assert!(!results.is_empty(), "should find MOSFETs in the subcategory");
+        for part in &results {
+            assert_eq!(part["subcategory_id"], mosfet_id);
+        }
+    }
+
+    #[test]
+    fn find_by_subcategory_primary_spec_numeric_filter() {
+        let db = real_db();
+        // Subcategory 2980 is Chip Resistor - Surface Mount in the fixture DBs used
+        // elsewhere in this workspace (pcbparts-search's own tests); resolve by name
+        // here instead of hardcoding an ID, since Phase 5 doesn't own that mapping.
+        let resistor_id = db.resolve_subcategory_name("Chip Resistor").unwrap();
+        let results = db.find_by_subcategory(resistor_id, Some("Resistance"), Some("10k"), 10, None, true, 10);
+        // Non-crashing + correct subcategory is the baseline for this zero-Python-coverage path.
+        for part in &results {
+            assert_eq!(part["subcategory_id"], resistor_id);
         }
     }
 }
