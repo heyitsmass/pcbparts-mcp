@@ -15,6 +15,7 @@ pub(crate) mod fixtures;
 use pcbparts_search::engine::{CategoryInfo, SearchEngine, SearchParams};
 use pcbparts_search::result::SubcategoryInfo;
 use rusqlite::Connection;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
@@ -115,6 +116,21 @@ impl ComponentsDb {
 
     pub fn subcategory_display_name(&self, subcategory_id: i64) -> Option<&str> {
         self.subcategories.get(&subcategory_id).map(|i| i.name.as_str())
+    }
+
+    pub fn get_by_lcsc(&self, lcsc: &str) -> Option<Value> {
+        let conn = self.conn.lock().unwrap();
+        lookup::get_by_lcsc(&conn, lcsc, &self.subcategories)
+    }
+
+    pub fn get_by_mpn(&self, mpn: &str) -> Vec<Value> {
+        let conn = self.conn.lock().unwrap();
+        lookup::get_by_mpn(&conn, mpn, &self.subcategories)
+    }
+
+    pub fn get_by_lcsc_batch(&self, lcsc_codes: &[String]) -> Result<HashMap<String, Option<Value>>, String> {
+        let conn = self.conn.lock().unwrap();
+        lookup::get_by_lcsc_batch(&conn, lcsc_codes, &self.subcategories)
     }
 }
 
@@ -268,6 +284,92 @@ mod tests {
         let db = real_db();
         for alias in ["wifi module", "bluetooth module", "lora module"] {
             assert!(db.resolve_subcategory_name(alias).is_some(), "alias '{alias}' should resolve");
+        }
+    }
+
+    // --- TestBatchLookup ---
+    #[test]
+    fn test_batch_lookup_returns_all_parts() {
+        let db = real_db();
+        let codes = vec!["C1525".to_string(), "C25804".to_string(), "C19702".to_string()];
+        let results = db.get_by_lcsc_batch(&codes).unwrap();
+        assert_eq!(results.len(), 3);
+        for code in &codes {
+            assert!(results.contains_key(code));
+            assert!(results[code].is_some());
+        }
+    }
+
+    #[test]
+    fn test_batch_lookup_handles_not_found() {
+        let db = real_db();
+        let codes = vec!["C1525".to_string(), "CNOTEXIST123".to_string()];
+        let results = db.get_by_lcsc_batch(&codes).unwrap();
+        assert!(results["C1525"].is_some());
+        assert!(results["CNOTEXIST123"].is_none());
+    }
+
+    #[test]
+    fn test_batch_lookup_dedupes_input() {
+        let db = real_db();
+        let codes = vec!["C1525".to_string(), "c1525".to_string(), "C1525".to_string()];
+        let results = db.get_by_lcsc_batch(&codes).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results.contains_key("C1525"));
+    }
+
+    // --- TestMPNLookup ---
+    #[test]
+    fn test_exact_mpn_match() {
+        let db = real_db();
+        let results = db.get_by_mpn("AO3400A");
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r["model"] == "AO3400A"));
+    }
+
+    #[test]
+    fn test_mpn_case_insensitive() {
+        let db = real_db();
+        let upper = db.get_by_mpn("AO3400A");
+        let lower = db.get_by_mpn("ao3400a");
+        assert_eq!(upper.len(), lower.len());
+        if !upper.is_empty() {
+            assert_eq!(upper[0]["lcsc"], lower[0]["lcsc"]);
+        }
+    }
+
+    #[test]
+    fn test_mpn_not_found() {
+        let db = real_db();
+        assert_eq!(db.get_by_mpn("TOTALLYFAKE12345XYZ"), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn test_mpn_empty_string() {
+        let db = real_db();
+        assert_eq!(db.get_by_mpn(""), Vec::<Value>::new());
+        assert_eq!(db.get_by_mpn("   "), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn test_mpn_with_distributor_suffix() {
+        let db = real_db();
+        let base_results = db.get_by_mpn("AO3400A");
+        if !base_results.is_empty() {
+            // Non-crashing is the baseline, matching the Python test's own weak assertion —
+            // AO3400A-TR may or may not be a separate MPN in the DB.
+            let _tr_results = db.get_by_mpn("AO3400A-TR");
+        }
+    }
+
+    #[test]
+    fn test_mpn_returns_correct_fields() {
+        let db = real_db();
+        let results = db.get_by_mpn("AO3400A");
+        if let Some(part) = results.first() {
+            for field in ["lcsc", "model", "manufacturer", "package", "stock", "price", "library_type", "specs"] {
+                assert!(part.get(field).is_some(), "missing field '{field}'");
+            }
         }
     }
 }
