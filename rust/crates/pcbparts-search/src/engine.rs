@@ -52,7 +52,9 @@ impl Default for SearchParams {
     ///
     /// Note: The following fields intentionally do NOT match Python's defaults:
     /// - `min_stock`: Rust default is `0`, Python default is `10` (via DEFAULT_MIN_STOCK).
-    ///   This is deferred to Phase 9 per the migration plan since Rust lacks default arguments.
+    ///   `pcbparts-db`'s `ComponentsDb::search()` (Phase 5) is the layer that actually
+    ///   applies Python's real default — this struct's own default stays `0` for direct
+    ///   `SearchEngine` callers/tests that don't want the clamp.
     /// - `sort_by`: Rust default is `"relevance"`, Python default is `"stock"`. Both produce
     ///   identical SQL currently, but this may diverge in future schema versions.
     fn default() -> Self {

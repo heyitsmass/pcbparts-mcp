@@ -10,3 +10,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 pcbparts-parsers = { path = "../pcbparts-parsers" }
 pcbparts-search = { path = "../pcbparts-search" }
+
+[dev-dependencies]
+pcbparts-smart-parser = { path = "../pcbparts-smart-parser" }
