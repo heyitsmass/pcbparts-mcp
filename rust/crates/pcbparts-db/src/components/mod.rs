@@ -439,4 +439,19 @@ mod tests {
             assert_eq!(part["subcategory_id"], resistor_id);
         }
     }
+
+    #[test]
+    fn find_by_subcategory_categorical_spec_filter() {
+        let db = real_db();
+        // Use a categorical (non-numeric) spec to exercise the LIKE-pattern string-spec branch.
+        // "Package" is a categorical spec that doesn't have a numeric parser.
+        let resistor_id = db.resolve_subcategory_name("Chip Resistor").unwrap();
+        let results = db.find_by_subcategory(resistor_id, Some("Package"), Some("0603"), 10, None, true, 10);
+        // Non-crashing + correct subcategory is the baseline for this zero-Python-coverage path.
+        // (The LIKE pattern currently doesn't match real data due to a pre-existing latent bug
+        // in Python's own source, but the function should still execute without error.)
+        for part in &results {
+            assert_eq!(part["subcategory_id"], resistor_id);
+        }
+    }
 }

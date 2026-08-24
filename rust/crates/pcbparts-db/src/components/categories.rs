@@ -84,7 +84,7 @@ pub fn find_by_subcategory(
     if let (Some(spec), Some(value)) = (primary_spec, primary_value) {
         if !is_numeric_spec {
             sql_parts.push("AND attributes LIKE ? ESCAPE '\\'".to_string());
-            let pattern = format!("%\"{}\", \"{}%", escape_like(spec), escape_like(value));
+            let pattern = format!("%\"{}\",\"{}\"%", escape_like(spec), escape_like(value));
             params.push(Box::new(pattern));
         }
     }
