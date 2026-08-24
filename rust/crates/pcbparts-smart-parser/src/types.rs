@@ -6,7 +6,10 @@ use std::sync::LazyLock;
 // Python's `sorted(SUBCATEGORY_ALIASES.keys(), key=len, reverse=True)`.
 static SUBCATEGORY_KEYWORDS_BY_LENGTH: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     let mut keys: Vec<&'static str> = subcategory_aliases().into_keys().collect();
-    keys.sort_by(|a, b| b.len().cmp(&a.len()));
+    // Sort by length (descending), then alphabetically (ascending) as tiebreak.
+    // HashMap iteration order is not stable across process runs, so a deterministic
+    // secondary sort key (lexicographic string comparison) is required for reproducible behavior.
+    keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     keys
 });
 
@@ -110,5 +113,24 @@ mod tests {
         assert_eq!(extract_mounting_type("SMT capacitor"), (Some("SMD".to_string()), "capacitor".to_string()));
         assert_eq!(extract_mounting_type("leaded diode"), (Some("Through Hole".to_string()), "diode".to_string()));
         assert_eq!(extract_mounting_type("no hint here"), (None, "no hint here".to_string()));
+    }
+
+    #[test]
+    fn same_length_keyword_tiebreak_determinism() {
+        // Regression test for non-deterministic tiebreak in keyword sort.
+        // "cap" and "pot" are both length 3 and will collide on length comparison.
+        // With deterministic tiebreak (alphabetical), "cap" always wins.
+        // Verify that calling extract_component_type twice with a query containing
+        // both keywords returns the same result both times (deterministic behavior).
+        let query = "cap and pot test";
+        let result1 = extract_component_type(query);
+        let result2 = extract_component_type(query);
+        assert_eq!(result1, result2, "extract_component_type must be deterministic across calls");
+        // Verify it matched "cap" (comes before "pot" alphabetically).
+        assert_eq!(
+            result1.2,
+            Some("cap".to_string()),
+            "deterministic tiebreak should match 'cap' before 'pot' alphabetically"
+        );
     }
 }
