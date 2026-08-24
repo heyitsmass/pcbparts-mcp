@@ -195,11 +195,9 @@ dependencies = [
 name = "pcbparts-search"
 version = "0.1.0"
 dependencies = [
- "pcbparts-db",
  "pcbparts-parsers",
  "regex",
  "rusqlite",
- "serde",
  "serde_json",
 ]
 

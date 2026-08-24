@@ -47,6 +47,13 @@ pub struct SearchParams {
 }
 
 impl Default for SearchParams {
+    /// Provides reasonable defaults for search parameters.
+    ///
+    /// Note: The following fields intentionally do NOT match Python's defaults:
+    /// - `min_stock`: Rust default is `0`, Python default is `10` (via DEFAULT_MIN_STOCK).
+    ///   This is deferred to Phase 9 per the migration plan since Rust lacks default arguments.
+    /// - `sort_by`: Rust default is `"relevance"`, Python default is `"stock"`. Both produce
+    ///   identical SQL currently, but this may diverge in future schema versions.
     fn default() -> Self {
         Self {
             query: None,
@@ -303,8 +310,8 @@ impl SearchEngine {
                 });
             }
         };
-        let lib_rows: Vec<(String, i64)> = match lib_stmt
-            .query_map(count_param_refs.as_slice(), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        let lib_rows: Vec<(Option<String>, i64)> = match lib_stmt
+            .query_map(count_param_refs.as_slice(), |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)))
         {
             Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
             Err(_) => {
@@ -318,9 +325,12 @@ impl SearchEngine {
         let mut library_type_counts = HashMap::from([("basic", 0i64), ("preferred", 0i64), ("extended", 0i64)]);
         let mut total = 0i64;
         for (code, count) in lib_rows {
-            let name = match code.as_str() { "b" => "basic", "p" => "preferred", "e" => "extended", _ => "" };
-            if let Some(v) = library_type_counts.get_mut(name) {
-                *v = count;
+            // A NULL library_type still contributes to total but doesn't get bucketed
+            if let Some(code_str) = code {
+                let name = match code_str.as_str() { "b" => "basic", "p" => "preferred", "e" => "extended", _ => "" };
+                if let Some(v) = library_type_counts.get_mut(name) {
+                    *v = count;
+                }
             }
             total += count;
         }
@@ -406,10 +416,22 @@ impl SearchEngine {
 
         let query = query.map(|q| crate::resolvers::expand_query_synonyms(&q));
 
-        let mut resolved_subcategory_id = subcategory_id;
+        // Apply Python truthiness semantics: treat empty strings as absent (matching `if x:` in Python)
+        let effective_subcategory_name = subcategory_name.as_ref().and_then(|n| if n.is_empty() { None } else { Some(n) });
+        let effective_category_name = category_name.as_ref().and_then(|n| if n.is_empty() { None } else { Some(n) });
+        let effective_package = package.as_ref().and_then(|p| if p.is_empty() { None } else { Some(p) });
+
+        // Apply Python truthiness semantics for IDs: treat 0 as absent (matching `if x:` in Python where 0 is falsy)
+        let effective_subcategory_id = subcategory_id.filter(|&id| id != 0);
+        let effective_category_id = category_id.filter(|&id| id != 0);
+
+        // Apply Python truthiness semantics for packages: empty list is falsy, treat as None (falls through to package check)
+        let effective_packages = packages.as_ref().and_then(|pkgs| if pkgs.is_empty() { None } else { Some(pkgs) });
+
+        let mut resolved_subcategory_id = effective_subcategory_id;
         let mut resolved_subcategory_display_name: Option<String> = None;
-        if let Some(name) = &subcategory_name {
-            if subcategory_id.is_none() {
+        if let Some(name) = effective_subcategory_name {
+            if effective_subcategory_id.is_none() {
                 resolved_subcategory_id = self.resolve_subcategory_name(name);
                 let Some(rid) = resolved_subcategory_id else {
                     let similar = self.find_similar_subcategories(name, 5);
@@ -424,10 +446,10 @@ impl SearchEngine {
             }
         }
 
-        let mut resolved_category_id = category_id;
+        let mut resolved_category_id = effective_category_id;
         let mut resolved_category_display_name: Option<String> = None;
-        if let Some(name) = &category_name {
-            if category_id.is_none() {
+        if let Some(name) = effective_category_name {
+            if effective_category_id.is_none() {
                 resolved_category_id = self.resolve_category_name(name);
                 let Some(rid) = resolved_category_id else {
                     return json!({
@@ -460,11 +482,11 @@ impl SearchEngine {
         let effective_query = query.as_ref().and_then(|q| if q.is_empty() { None } else { Some(q.as_str()) });
 
         let mut expanded_packages: Vec<String> = Vec::new();
-        if let Some(pkgs) = &packages {
+        if let Some(pkgs) = effective_packages {
             for p in pkgs {
                 expanded_packages.extend(expand_package(p));
             }
-        } else if let Some(p) = &package {
+        } else if let Some(p) = effective_package {
             expanded_packages = expand_package(p);
         }
 
@@ -681,5 +703,97 @@ mod tests {
             ..Default::default()
         });
         assert!(result_or["total"].as_i64().unwrap_or(0) >= 1, "OR query should return results");
+    }
+
+    #[test]
+    fn test_empty_category_name_treated_as_none() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // Empty category_name should be treated as None, not resolve to shortest category
+        let result = engine.search(&conn, SearchParams {
+            category_name: Some("".to_string()),
+            min_stock: 0,
+            ..Default::default()
+        });
+        // Should not error about "Category not found"; should return results like no category was specified
+        assert!(result["error"].is_null(), "Empty category_name should not produce an error");
+        assert!(result["total"].as_i64().unwrap_or(0) >= 1, "Empty category_name should behave like no filter");
+    }
+
+    #[test]
+    fn test_empty_subcategory_name_treated_as_none() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // Empty subcategory_name should be treated as None, not attempt resolution
+        let result = engine.search(&conn, SearchParams {
+            subcategory_name: Some("".to_string()),
+            min_stock: 0,
+            ..Default::default()
+        });
+        // Should not error about "Subcategory not found"; should return results
+        assert!(result["error"].is_null(), "Empty subcategory_name should not produce an error");
+        assert!(result["total"].as_i64().unwrap_or(0) >= 1, "Empty subcategory_name should behave like no filter");
+    }
+
+    #[test]
+    fn test_empty_package_treated_as_none() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // Empty package should be treated as None, not expand to [""]
+        let result = engine.search(&conn, SearchParams {
+            package: Some("".to_string()),
+            min_stock: 0,
+            ..Default::default()
+        });
+        // Should not produce "Query contains no searchable terms" or similar
+        assert!(result["error"].is_null(), "Empty package should not produce an error");
+        assert!(result["total"].as_i64().unwrap_or(0) >= 1, "Empty package should behave like no filter");
+    }
+
+    #[test]
+    fn test_empty_packages_vec_falls_through_to_package() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // Empty packages vec should fall through to check package parameter
+        // With both packages=Some(vec![]) and package=None, should behave like neither was specified
+        let result = engine.search(&conn, SearchParams {
+            packages: Some(vec![]),
+            min_stock: 0,
+            ..Default::default()
+        });
+        assert!(result["error"].is_null(), "Empty packages vec should not produce an error");
+        assert!(result["total"].as_i64().unwrap_or(0) >= 1, "Empty packages vec should behave like no filter");
+    }
+
+    #[test]
+    fn test_zero_category_id_treated_as_none() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // category_id=Some(0) should be treated as None when deciding whether to resolve category_name
+        let result = engine.search(&conn, SearchParams {
+            category_id: Some(0),
+            category_name: Some("resistors".to_string()),
+            min_stock: 0,
+            ..Default::default()
+        });
+        // Should resolve "resistors" to category 10 since category_id=0 is treated as falsy
+        let filters_applied = &result["filters_applied"];
+        assert_eq!(filters_applied["category_resolved"], "Resistors", "category_id=0 should allow category_name resolution");
+    }
+
+    #[test]
+    fn test_zero_subcategory_id_treated_as_none() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // subcategory_id=Some(0) should be treated as None when deciding whether to resolve subcategory_name
+        let result = engine.search(&conn, SearchParams {
+            subcategory_id: Some(0),
+            subcategory_name: Some("chip resistor".to_string()),
+            min_stock: 0,
+            ..Default::default()
+        });
+        // Should resolve "chip resistor" (or similar partial match) since subcategory_id=0 is treated as falsy
+        let filters_applied = &result["filters_applied"];
+        assert_eq!(filters_applied["subcategory_resolved"], "Chip Resistor - Surface Mount", "subcategory_id=0 should allow subcategory_name resolution");
     }
 }
