@@ -179,7 +179,9 @@ earlier ones being in place.
    `result.py`, `query_builder.py`, `engine.py`. Depends on phase 2 and on
    `pcbparts-db`'s `Connection` type from phase 1 (not on phase 5's
    component-DB code — see below). One Rust module per Python file, same
-   as Phase 2's convention.
+   as Phase 2's convention. **Done** — see
+   `docs/superpowers/plans/2026-08-22-rust-phase3-search-crate.md`
+   (main `f40fd80`, 323/323 workspace tests passing).
    Tests: `test_resolvers.py` (covers `mpn.py` only). No other dedicated
    pytest file exists for this crate's ~1,660 remaining lines (see the
    Phase 3 correction above) — coverage comes from new characterization
