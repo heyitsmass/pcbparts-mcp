@@ -171,22 +171,28 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
         .is_some_and(|kw| CONNECTOR_WORDS.iter().any(|w| kw.to_lowercase().contains(w)));
     if is_connector {
         if let Some(m) = STANDALONE_NUMBER_RE.find(&remaining) {
-            let num_val: i64 = m.as_str().parse().unwrap();
-            if (1..=200).contains(&num_val) && !values.iter().any(|v| v.unit_type == "pin_count") {
-                values.push(ExtractedValue {
-                    raw: m.as_str().to_string(),
-                    value: num_val as f64,
-                    unit_type: "pin_count".to_string(),
-                    normalized: format!("{num_val}P"),
-                });
-                detected
-                    .entry("values")
-                    .or_insert_with(|| serde_json::Value::Array(vec![]))
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!({"raw": m.as_str(), "type": "pin_count", "normalized": format!("{num_val}P")}));
-                remaining = format!("{}{}", &remaining[..m.start()], &remaining[m.end()..]);
-                remaining = WHITESPACE_RE.replace_all(remaining.trim(), " ").to_string();
+            // A pathologically long digit string (19+ digits) exceeds i64::MAX and
+            // would panic on `.unwrap()`. Gate on `Ok` instead — an out-of-range parse
+            // is simply treated as "not a valid pin count" and skipped, matching
+            // Python's arbitrary-precision `int()` combined with the subsequent range
+            // check (no realistic query contains a number this long).
+            if let Ok(num_val) = m.as_str().parse::<i64>() {
+                if (1..=200).contains(&num_val) && !values.iter().any(|v| v.unit_type == "pin_count") {
+                    values.push(ExtractedValue {
+                        raw: m.as_str().to_string(),
+                        value: num_val as f64,
+                        unit_type: "pin_count".to_string(),
+                        normalized: format!("{num_val}P"),
+                    });
+                    detected
+                        .entry("values")
+                        .or_insert_with(|| serde_json::Value::Array(vec![]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"raw": m.as_str(), "type": "pin_count", "normalized": format!("{num_val}P")}));
+                    remaining = format!("{}{}", &remaining[..m.start()], &remaining[m.end()..]);
+                    remaining = WHITESPACE_RE.replace_all(remaining.trim(), " ").to_string();
+                }
             }
         }
     }
@@ -216,16 +222,19 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
     // 30" -> the "30" is parsed as 30Ω impedance.
     if result.subcategory.as_deref().map(str::to_lowercase).as_deref() == Some("ferrite beads") {
         if let Some(m) = STANDALONE_NUMBER_RE.find(&remaining) {
-            let num_val: i64 = m.as_str().parse().unwrap();
-            if (1..=5000).contains(&num_val) && !values.iter().any(|v| v.unit_type == "resistance") {
-                values.push(ExtractedValue {
-                    raw: m.as_str().to_string(),
-                    value: num_val as f64,
-                    unit_type: "resistance".to_string(),
-                    normalized: format!("{num_val}Ohm"),
-                });
-                remaining = format!("{}{}", &remaining[..m.start()], &remaining[m.end()..]);
-                remaining = WHITESPACE_RE.replace_all(remaining.trim(), " ").to_string();
+            // See the Step 4a comment above: gate on `Ok` rather than unwrapping, so an
+            // oversized digit string is skipped instead of panicking.
+            if let Ok(num_val) = m.as_str().parse::<i64>() {
+                if (1..=5000).contains(&num_val) && !values.iter().any(|v| v.unit_type == "resistance") {
+                    values.push(ExtractedValue {
+                        raw: m.as_str().to_string(),
+                        value: num_val as f64,
+                        unit_type: "resistance".to_string(),
+                        normalized: format!("{num_val}Ohm"),
+                    });
+                    remaining = format!("{}{}", &remaining[..m.start()], &remaining[m.end()..]);
+                    remaining = WHITESPACE_RE.replace_all(remaining.trim(), " ").to_string();
+                }
             }
         }
     }
@@ -509,6 +518,154 @@ mod tests {
         assert_eq!(r.spec_filters[0].value, "10uH");
         assert_eq!(r.spec_filters[1].name, "Current Rating");
         assert_eq!(r.spec_filters[1].value, "2A");
+    }
+
+    // --- TestSmartQueryParsing (tests/test_db.py:813-986) — ported 1:1, real pytest
+    // assertions on `parse_smart_query`'s return value (no DB access, so all 12
+    // methods are in scope for this crate). ---
+    #[test]
+    fn test_parse_resistor_query() {
+        let r = parse_smart_query("10k resistor 0603 1%");
+        assert_eq!(r.subcategory.as_deref(), Some("chip resistor - surface mount"));
+        assert_eq!(r.package.as_deref(), Some("0603"));
+        assert_eq!(r.spec_filters.len(), 2);
+
+        let res_filter = r.spec_filters.iter().find(|f| f.name == "Resistance").expect("Resistance filter");
+        assert_eq!(res_filter.operator.as_str(), "=");
+        assert!(res_filter.value.to_lowercase().contains("10k"));
+
+        let tol_filter = r.spec_filters.iter().find(|f| f.name == "Tolerance").expect("Tolerance filter");
+        assert_eq!(tol_filter.value, "1%");
+    }
+
+    #[test]
+    fn test_parse_capacitor_query() {
+        let r = parse_smart_query("100nF 25V capacitor");
+        assert_eq!(r.subcategory.as_deref(), Some("multilayer ceramic capacitors mlcc - smd/smt"));
+        assert!(r.spec_filters.len() >= 2);
+
+        let cap_filter = r.spec_filters.iter().find(|f| f.name == "Capacitance").expect("Capacitance filter");
+        assert_eq!(cap_filter.value, "100nF");
+
+        // "Voltage Rating" (correct spec name), not generic "Voltage".
+        let volt_filter = r.spec_filters.iter().find(|f| f.name.contains("Voltage")).expect("Voltage filter");
+        assert_eq!(volt_filter.operator.as_str(), ">=");
+        assert!(volt_filter.value.contains("25V"));
+    }
+
+    #[test]
+    fn test_parse_mosfet_query() {
+        let r = parse_smart_query("n-channel mosfet SOT-23");
+        assert_eq!(r.subcategory.as_deref(), Some("mosfets"));
+        assert_eq!(r.package.as_deref(), Some("SOT-23"));
+    }
+
+    #[test]
+    fn test_parse_inductor_query() {
+        let r = parse_smart_query("10uH inductor");
+        assert_eq!(r.subcategory.as_deref(), Some("inductors (smd)"));
+        let ind_filter = r.spec_filters.iter().find(|f| f.name == "Inductance").expect("Inductance filter");
+        assert_eq!(ind_filter.value, "10uH");
+    }
+
+    // Load-bearing: the only existing test where the local `subcategory` binding
+    // stays `None` (no keyword matched) while `result.subcategory` is set by
+    // Step 4b's value-based inference — exercises the divergence between the two
+    // bindings at the Step 6 `map_value_to_spec` call site.
+    #[test]
+    fn test_parse_query_infers_category() {
+        let r = parse_smart_query("10k 0402");
+        assert_eq!(r.subcategory.as_deref(), Some("chip resistor - surface mount"));
+        assert_eq!(r.package.as_deref(), Some("0402"));
+
+        let r = parse_smart_query("100nF 0805");
+        assert_eq!(r.subcategory.as_deref(), Some("multilayer ceramic capacitors mlcc - smd/smt"));
+        assert_eq!(r.package.as_deref(), Some("0805"));
+    }
+
+    #[test]
+    fn test_parse_query_remaining_text() {
+        let r = parse_smart_query("ESP32 module 3.3V");
+        let lower = r.remaining_text.to_lowercase();
+        assert!(lower.contains("esp32") || lower.contains("module"));
+        assert!(r.spec_filters.iter().any(|f| f.name.contains("Voltage")));
+    }
+
+    #[test]
+    fn test_parse_empty_query() {
+        let r = parse_smart_query("");
+        assert_eq!(r.remaining_text, "");
+        assert_eq!(r.subcategory, None);
+
+        let r = parse_smart_query("abc");
+        assert_eq!(r.remaining_text, "abc");
+    }
+
+    #[test]
+    fn test_parse_antenna_with_frequency() {
+        let r = parse_smart_query("ceramic antenna 2.4GHz");
+        assert_eq!(r.subcategory.as_deref(), Some("antennas"));
+
+        let freq_filter = r.spec_filters.iter().find(|f| f.name.to_lowercase().contains("freq"));
+        assert!(freq_filter.is_some());
+        assert_eq!(freq_filter.unwrap().value, "2.4GHz");
+    }
+
+    #[test]
+    fn test_parse_humidity_temperature_sensor() {
+        let r = parse_smart_query("humidity temperature sensor I2C");
+        assert_eq!(r.subcategory.as_deref(), Some("temperature and humidity sensor"));
+
+        let interface_filters: Vec<_> = r.spec_filters.iter().filter(|f| f.name == "Interface").collect();
+        assert_eq!(interface_filters.len(), 1);
+        assert_eq!(interface_filters[0].value, "I2C");
+    }
+
+    #[test]
+    fn test_rj45_not_treated_as_model_number() {
+        let r = parse_smart_query("RJ45 connector THT");
+        assert_eq!(r.model_number, None);
+        assert_eq!(r.subcategory.as_deref(), Some("ethernet connectors / modular connectors (rj45 rj11)"));
+        assert_eq!(r.mounting_type.as_deref(), Some("Through Hole"));
+
+        for code in ["RJ11", "RJ12"] {
+            let r = parse_smart_query(&format!("{code} connector"));
+            assert_eq!(r.model_number, None, "{code} should not be detected as model number");
+        }
+    }
+
+    // Load-bearing: the only existing test of the "magnetics" -> "filtered"
+    // connector-text-cleanup logic (Step 7a), which reads the LOCAL `subcategory`
+    // binding rather than `result.subcategory`.
+    #[test]
+    fn test_magnetics_synonym_for_filtered_connectors() {
+        let r = parse_smart_query("RJ45 magnetics THT");
+        assert_eq!(r.subcategory.as_deref(), Some("ethernet connectors / modular connectors (rj45 rj11)"));
+        assert_eq!(r.mounting_type.as_deref(), Some("Through Hole"));
+        assert_eq!(r.remaining_text, "filtered");
+
+        // "magnetics" -> "filtered" replacement only happens for connectors.
+        let r_non_connector = parse_smart_query("magnetics sensor");
+        assert!(!r_non_connector.remaining_text.to_lowercase().contains("filtered"));
+    }
+
+    #[test]
+    fn test_csp_package_detection() {
+        for (query, expected_package) in [
+            ("STM32L4 WLCSP144", "WLCSP144"),
+            ("STM32F4 LFCSP64", "LFCSP64"),
+            ("sensor UCSP-20", "UCSP-20"),
+            ("chip CSP100", "CSP100"),
+            ("IC VCSP48", "VCSP48"),
+        ] {
+            let r = parse_smart_query(query);
+            assert_eq!(r.package.as_deref(), Some(expected_package), "query: {query}");
+        }
+
+        // CSP packages should not be treated as model numbers.
+        let r = parse_smart_query("CSP100");
+        assert_eq!(r.package.as_deref(), Some("CSP100"));
+        assert_eq!(r.model_number, None);
     }
 
     // --- merge_spec_filters: zero pytest coverage, characterization only ---

@@ -12,6 +12,9 @@ pub use mapping::{category_attribute_map, infer_subcategory_from_values, map_val
 pub use models::extract_model_number;
 pub use packages::extract_package;
 pub use parser::{merge_spec_filters, parse_smart_query, ParsedQuery};
-pub use semantic::{connector_noise_words, extract_semantic_descriptors, noise_words, remove_noise_words, SemanticFilter};
+pub use semantic::{
+    connector_noise_words, extract_semantic_descriptors, noise_words, remove_noise_words, semantic_descriptors,
+    SemanticFilter,
+};
 pub use types::{extract_component_type, extract_mounting_type};
 pub use values::{extract_values, ExtractedValue};

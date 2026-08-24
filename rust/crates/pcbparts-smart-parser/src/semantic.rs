@@ -20,8 +20,9 @@ impl SemanticFilter {
 
 /// Semantic descriptor mappings, in the exact order the Python `SEMANTIC_DESCRIPTORS`
 /// dict literal declares them — order matters as a stable tie-break for descriptors of
-/// equal length (see `SORTED_DESCRIPTORS` below).
-fn semantic_descriptors() -> Vec<(&'static str, Vec<SemanticFilter>)> {
+/// equal length (see `SORTED_DESCRIPTORS` below). Rust equivalent of Python's
+/// `SEMANTIC_DESCRIPTORS` module-level dict, re-exported at the crate root.
+pub fn semantic_descriptors() -> Vec<(&'static str, Vec<SemanticFilter>)> {
     vec![
         ("low vgs", vec![SemanticFilter::new("Vgs(th)", "<", "2.5V", "low vgs")]),
         ("low vgs(th)", vec![SemanticFilter::new("Vgs(th)", "<", "2.5V", "low vgs(th)")]),
