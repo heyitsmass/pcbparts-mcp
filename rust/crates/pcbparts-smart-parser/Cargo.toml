@@ -1,0 +1,10 @@
+[package]
+name = "pcbparts-smart-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+pcbparts-parsers = { path = "../pcbparts-parsers" }
+pcbparts-search = { path = "../pcbparts-search" }
