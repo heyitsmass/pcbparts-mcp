@@ -23,16 +23,19 @@ pub fn row_to_dict(row: &Row, subcategories: &BTreeMap<i64, SubcategoryInfo>) ->
         // `except (json.JSONDecodeError, TypeError)` fallback.
     }
 
-    let library_type_code: String = row.get("library_type").unwrap_or_default();
-    let library_type = match library_type_code.as_str() {
-        "b" => "basic".to_string(),
-        "p" => "preferred".to_string(),
-        "e" => "extended".to_string(),
-        other => other.to_string(),
+    let library_type_code: Option<String> = row.get("library_type").unwrap_or(None);
+    let library_type_value = match library_type_code.as_deref() {
+        Some("b") => Value::String("basic".to_string()),
+        Some("p") => Value::String("preferred".to_string()),
+        Some("e") => Value::String("extended".to_string()),
+        Some(other) => Value::String(other.to_string()),
+        None => Value::Null,
     };
+    let preferred = library_type_code.as_deref().map(|code| code == "b" || code == "p").unwrap_or(false);
 
-    let subcategory_id: i64 = row.get("subcategory_id").unwrap_or_default();
-    let subcat_info = subcategories.get(&subcategory_id);
+    let stock: Option<i64> = row.get("stock").unwrap_or(None);
+    let subcategory_id: Option<i64> = row.get("subcategory_id").unwrap_or(None);
+    let subcat_info = subcategory_id.and_then(|id| subcategories.get(&id));
     let package: Option<String> = row.get("package").unwrap_or(None);
     let category = subcat_info.and_then(|i| i.category_name.clone());
     let subcategory = subcat_info.map(|i| i.name.clone());
@@ -42,11 +45,11 @@ pub fn row_to_dict(row: &Row, subcategories: &BTreeMap<i64, SubcategoryInfo>) ->
         "model": row.get::<_, Option<String>>("mpn").unwrap_or(None),
         "manufacturer": row.get::<_, Option<String>>("manufacturer").unwrap_or(None),
         "package": package,
-        "stock": row.get::<_, i64>("stock").unwrap_or_default(),
+        "stock": stock,
         "price": row.get::<_, Option<f64>>("price").unwrap_or(None),
         "price_10": Value::Null,
-        "library_type": library_type,
-        "preferred": library_type_code == "b" || library_type_code == "p",
+        "library_type": library_type_value,
+        "preferred": preferred,
         "category": category,
         "subcategory": subcategory,
         "subcategory_id": subcategory_id,
@@ -147,5 +150,31 @@ mod tests {
         assert_eq!(dict["category"], serde_json::Value::Null);
         assert_eq!(dict["subcategory"], serde_json::Value::Null);
         assert_eq!(dict["specs"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_row_to_dict_null_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE components (
+                lcsc TEXT, mpn TEXT, manufacturer TEXT, package TEXT, stock INTEGER,
+                library_type TEXT, subcategory_id INTEGER, price REAL, description TEXT, attributes TEXT
+            );
+            INSERT INTO components VALUES ('C2', 'M2', 'Mfr2', 'PKG', NULL, NULL, NULL, 0.05, 'desc2', NULL);",
+        )
+        .unwrap();
+        let subcategories: BTreeMap<i64, SubcategoryInfo> = BTreeMap::new();
+        let mut stmt = conn.prepare("SELECT * FROM components").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let dict = row_to_dict(row, &subcategories);
+
+        // When columns are NULL, corresponding JSON fields should be null, not default values
+        assert_eq!(dict["stock"], serde_json::Value::Null);
+        assert_eq!(dict["library_type"], serde_json::Value::Null);
+        assert_eq!(dict["preferred"], false);
+        assert_eq!(dict["subcategory_id"], serde_json::Value::Null);
+        assert_eq!(dict["category"], serde_json::Value::Null);
+        assert_eq!(dict["subcategory"], serde_json::Value::Null);
     }
 }
