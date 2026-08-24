@@ -62,15 +62,28 @@ pub fn list_attributes(
     let mut attr_counts: HashMap<String, i64> = HashMap::new();
     let mut attr_values: HashMap<String, Vec<String>> = HashMap::new();
     let mut attr_values_seen: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut attr_order: Vec<String> = Vec::new();
 
     for row in rows.filter_map(|r| r.ok()) {
         let Some(attrs_json) = row.filter(|s| !s.is_empty()) else { continue };
-        let Ok(pairs) = serde_json::from_str::<Vec<(String, String)>>(&attrs_json) else { continue };
-        for (name, value) in pairs {
-            *attr_counts.entry(name.clone()).or_insert(0) += 1;
-            let seen = attr_values_seen.entry(name.clone()).or_default();
-            if seen.len() < 100 && seen.insert(value.clone()) {
-                attr_values.entry(name).or_default().push(value);
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&attrs_json) else { continue };
+        let Some(arr) = parsed.as_array() else { continue };
+
+        for item in arr {
+            let Some(pair_arr) = item.as_array() else { continue };
+            if pair_arr.len() != 2 {
+                continue;
+            }
+            let Some(name) = pair_arr[0].as_str() else { continue };
+            let Some(value) = pair_arr[1].as_str() else { continue };
+
+            if !attr_counts.contains_key(name) {
+                attr_order.push(name.to_string());
+            }
+            *attr_counts.entry(name.to_string()).or_insert(0) += 1;
+            let seen = attr_values_seen.entry(name.to_string()).or_default();
+            if seen.len() < 100 && seen.insert(value.to_string()) {
+                attr_values.entry(name.to_string()).or_default().push(value.to_string());
             }
         }
     }
@@ -83,7 +96,10 @@ pub fn list_attributes(
         }
     }
 
-    let mut sorted_names: Vec<(&String, &i64)> = attr_counts.iter().collect();
+    let mut sorted_names: Vec<(&String, &i64)> = attr_order
+        .iter()
+        .filter_map(|name| attr_counts.get(name).map(|count| (name, count)))
+        .collect();
     sorted_names.sort_by_key(|(_, count)| -**count);
 
     let mut attributes = Vec::new();
