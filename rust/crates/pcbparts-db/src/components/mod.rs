@@ -161,6 +161,11 @@ impl ComponentsDb {
         let min_stock = min_stock.max(DEFAULT_MIN_STOCK);
         categories::find_by_subcategory(&conn, &self.subcategories, subcategory_id, primary_spec, primary_value, min_stock, library_type, prefer_no_fee, limit)
     }
+
+    pub fn list_attributes(&self, subcategory_id: Option<i64>, subcategory_name: Option<&str>, sample_size: i64) -> Value {
+        let conn = self.conn.lock().unwrap();
+        attributes::list_attributes(&conn, &self.subcategories, &self.subcategory_name_to_id, subcategory_id, subcategory_name, sample_size)
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +458,102 @@ mod tests {
         for part in &results {
             assert_eq!(part["subcategory_id"], resistor_id);
         }
+    }
+
+    // --- TestListAttributes ---
+    #[test]
+    fn test_list_mosfet_attributes() {
+        let db = real_db();
+        let result = db.list_attributes(None, Some("MOSFETs"), 1000);
+        assert!(result.get("error").is_none());
+        assert_eq!(result["subcategory_name"], "MOSFETs");
+        let attrs = result["attributes"].as_array().unwrap();
+        assert!(attrs.len() > 5);
+
+        let names: Vec<&str> = attrs.iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert!(names.iter().any(|n| n.contains("Vgs") || n.contains("Gate")));
+        assert!(names.iter().any(|n| n.contains("Type")));
+    }
+
+    #[test]
+    fn test_list_attributes_includes_type_info() {
+        let db = real_db();
+        let result = db.list_attributes(None, Some("MOSFETs"), 1000);
+        for attr in result["attributes"].as_array().unwrap() {
+            let ty = attr["type"].as_str().unwrap();
+            assert!(ty == "numeric" || ty == "string");
+            assert!(attr.get("count").is_some());
+        }
+    }
+
+    #[test]
+    fn test_list_attributes_includes_aliases() {
+        let db = real_db();
+        let result = db.list_attributes(None, Some("MOSFETs"), 1000);
+        let vgs_attr = result["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"].as_str().unwrap_or_default().contains("Gate Threshold"));
+        if let Some(attr) = vgs_attr {
+            assert_eq!(attr["alias"], "Vgs(th)");
+        }
+    }
+
+    #[test]
+    fn test_list_attributes_not_found() {
+        let db = real_db();
+        let result = db.list_attributes(None, Some("NonExistent12345"), 1000);
+        assert!(result.get("error").is_some());
+    }
+
+    #[test]
+    fn test_list_attributes_numeric_sort_for_height() {
+        use pcbparts_parsers::parsers::parse_length_mm;
+        let db = real_db();
+        let result = db.list_attributes(Some(2965), None, 1000);
+        let height = result["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "Height - Seated (Max)")
+            .expect("Height attribute should be present in subcat 2965");
+        assert_eq!(height["type"], "numeric");
+
+        let values = height["values"].as_array().unwrap();
+        assert!(!values.is_empty(), "Height values should not be empty");
+        let first = values[0].as_str().unwrap();
+        let first_parsed = parse_length_mm(first).expect("first value should parse");
+        assert!(first_parsed < 10.0, "first value should be under 10mm, got {first:?}");
+        if let Some(dash_pos) = values.iter().position(|v| v == "-") {
+            assert!(dash_pos > 0);
+        }
+    }
+
+    #[test]
+    fn test_list_attributes_numeric_min_max() {
+        let db = real_db();
+        let result = db.list_attributes(Some(2965), None, 1000);
+        let height = result["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "Height - Seated (Max)")
+            .unwrap();
+        let min = height["min"].as_f64().unwrap();
+        let max = height["max"].as_f64().unwrap();
+        assert!(min < max);
+        assert!((2.0..=6.0).contains(&min));
+        assert!((15.0..=40.0).contains(&max));
+    }
+
+    #[test]
+    fn test_list_capacitor_attributes() {
+        let db = real_db();
+        let result = db.list_attributes(None, Some("MLCC"), 1000);
+        assert!(result.get("error").is_none());
+        let names: Vec<&str> = result["attributes"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert!(names.iter().any(|n| n.contains("Capacitance")));
+        assert!(names.iter().any(|n| n.contains("Voltage")));
     }
 }
