@@ -3,3 +3,4 @@ pub mod models;
 pub mod packages;
 pub mod connectors;
 pub mod semantic;
+pub mod types;
