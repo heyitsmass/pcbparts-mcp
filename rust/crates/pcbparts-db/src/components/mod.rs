@@ -166,6 +166,11 @@ impl ComponentsDb {
         let conn = self.conn.lock().unwrap();
         attributes::list_attributes(&conn, &self.subcategories, &self.subcategory_name_to_id, subcategory_id, subcategory_name, sample_size)
     }
+
+    pub fn get_stats(&self) -> Value {
+        let conn = self.conn.lock().unwrap();
+        stats::get_stats(&conn, &self.categories, &self.subcategories)
+    }
 }
 
 #[cfg(test)]
@@ -555,5 +560,21 @@ mod tests {
         let names: Vec<&str> = result["attributes"].as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
         assert!(names.iter().any(|n| n.contains("Capacitance")));
         assert!(names.iter().any(|n| n.contains("Voltage")));
+    }
+
+    // --- TestDatabaseStats ---
+    #[test]
+    fn test_get_stats() {
+        let db = real_db();
+        let stats = db.get_stats();
+
+        assert!(stats["total_parts"].as_i64().unwrap() > 0);
+
+        let by_lib = &stats["by_library_type"];
+        assert!(by_lib.get("basic").is_some());
+        assert!(by_lib.get("preferred").is_some());
+        assert!(by_lib.get("extended").is_some());
+
+        assert!(stats["subcategories"].as_i64().unwrap() > 0);
     }
 }
