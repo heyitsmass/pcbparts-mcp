@@ -56,13 +56,13 @@ impl Default for SearchParams {
             category_name: None,
             spec_filters: Vec::new(),
             library_type: None,
-            prefer_no_fee: false,
+            prefer_no_fee: true,
             min_stock: 0,
             package: None,
             packages: None,
             manufacturer: None,
             mounting_type: None,
-            match_all_terms: false,
+            match_all_terms: true,
             sort_by: "relevance".to_string(),
             limit: 50,
             offset: 0,
@@ -293,12 +293,27 @@ impl SearchEngine {
             }
         };
 
-        let mut lib_stmt = conn.prepare(&lib_count_sql).unwrap();
-        let lib_rows: Vec<(String, i64)> = lib_stmt
+        // Guard lib-count query like main SELECT (defense-in-depth for too-many-bound-variables errors)
+        let mut lib_stmt = match conn.prepare(&lib_count_sql) {
+            Ok(s) => s,
+            Err(_) => {
+                return json!({
+                    "error": "Search failed: query too complex. Reduce the number of filters.",
+                    "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false,
+                });
+            }
+        };
+        let lib_rows: Vec<(String, i64)> = match lib_stmt
             .query_map(count_param_refs.as_slice(), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+        {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => {
+                return json!({
+                    "error": "Search failed: query too complex. Reduce the number of filters.",
+                    "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false,
+                });
+            }
+        };
 
         let mut library_type_counts = HashMap::from([("basic", 0i64), ("preferred", 0i64), ("extended", 0i64)]);
         let mut total = 0i64;
@@ -425,18 +440,24 @@ impl SearchEngine {
             }
         }
 
+        // Empty-string queries (Some("")) are treated as no query, matching Python's `if query:` truthiness check
         if let Some(q) = &query {
-            if q.chars().count() > 500 {
-                return json!({"error": "Query too long (max 500 characters)", "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false});
-            }
-            if q.chars().any(|c| (c as u32) < 32 && !['\t', '\n', '\r'].contains(&c)) || q.contains('\0') {
-                return json!({"error": "Query contains invalid characters", "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false});
-            }
-            let (fts_sql, _) = build_fts_clause(q, match_all_terms);
-            if fts_sql.is_empty() {
-                return json!({"error": "Query contains no searchable terms", "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false});
+            if !q.is_empty() {
+                if q.chars().count() > 500 {
+                    return json!({"error": "Query too long (max 500 characters)", "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false});
+                }
+                if q.chars().any(|c| (c as u32) < 32 && !['\t', '\n', '\r'].contains(&c)) || q.contains('\0') {
+                    return json!({"error": "Query contains invalid characters", "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false});
+                }
+                let (fts_sql, _) = build_fts_clause(q, match_all_terms);
+                if fts_sql.is_empty() {
+                    return json!({"error": "Query contains no searchable terms", "results": [], "total": 0, "library_type_counts": empty_counts(), "no_fee_available": false});
+                }
             }
         }
+
+        // Treat empty-string queries as no query for FTS purposes
+        let effective_query = query.as_ref().and_then(|q| if q.is_empty() { None } else { Some(q.as_str()) });
 
         let mut expanded_packages: Vec<String> = Vec::new();
         if let Some(pkgs) = &packages {
@@ -448,14 +469,14 @@ impl SearchEngine {
         }
 
         let mut search_result = self.execute_search(
-            conn, query.as_deref(), resolved_subcategory_id, resolved_category_id, &spec_filters,
+            conn, effective_query, resolved_subcategory_id, resolved_category_id, &spec_filters,
             library_type.as_deref(), min_stock, &expanded_packages, manufacturer.as_deref(),
             mounting_type.as_deref(), match_all_terms, &sort_by, prefer_no_fee, limit, offset,
         );
 
         let mut mpn_retry_query: Option<String> = None;
         if search_result["total"] == 0 {
-            if let Some(q) = &query {
+            if let Some(q) = effective_query {
                 if looks_like_mpn(q) {
                     for variant in normalize_mpn(q).into_iter().skip(1) {
                         let retry = self.execute_search(
@@ -627,5 +648,38 @@ mod tests {
     fn test_resolve_category_name_shortest_match() {
         let engine = test_engine();
         assert_eq!(engine.resolve_category_name("resistor"), Some(10));
+    }
+
+    #[test]
+    fn test_empty_query_treated_as_no_query() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // Empty query should not produce error; should behave like no query filter
+        let result = engine.search(&conn, SearchParams { query: Some("".to_string()), min_stock: 10, ..Default::default() });
+        assert!(result["error"].is_null(), "Empty query should not produce error");
+        assert!(result["total"].as_i64().unwrap_or(0) >= 1, "Empty query should return results");
+    }
+
+    #[test]
+    fn test_multi_word_query_and_semantics() {
+        let conn = test_conn();
+        let engine = test_engine();
+        // With match_all_terms=true (default), "resistor microcontroller" should use AND (no results)
+        // With match_all_terms=false, should use OR (would return both)
+        let result_and = engine.search(&conn, SearchParams {
+            query: Some("resistor microcontroller".to_string()),
+            match_all_terms: true,
+            min_stock: 0,
+            ..Default::default()
+        });
+        assert_eq!(result_and["total"], 0, "AND query should return no results");
+
+        let result_or = engine.search(&conn, SearchParams {
+            query: Some("resistor microcontroller".to_string()),
+            match_all_terms: false,
+            min_stock: 0,
+            ..Default::default()
+        });
+        assert!(result_or["total"].as_i64().unwrap_or(0) >= 1, "OR query should return results");
     }
 }
