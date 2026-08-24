@@ -219,7 +219,7 @@ pub fn extract_values(query: &str) -> (Vec<ExtractedValue>, String) {
     // Pin count (normalize to "XP" format to match database values like "8P", "16P")
     for caps in PINS.captures_iter(query) {
         let m = caps.get(0).unwrap();
-        let pins: i64 = caps[1].parse().unwrap();
+        let pins: i64 = caps[1].parse().unwrap_or(i64::MAX);
         extractions.push((m.start(), m.end(), ExtractedValue::new(m.as_str(), pins as f64, "pin_count", format!("{pins}P"))));
     }
 
@@ -229,7 +229,7 @@ pub fn extract_values(query: &str) -> (Vec<ExtractedValue>, String) {
         if overlaps(&extractions, m.start()) {
             continue;
         }
-        let positions: i64 = caps[1].parse().unwrap();
+        let positions: i64 = caps[1].parse().unwrap_or(i64::MAX);
         extractions.push((m.start(), m.end(), ExtractedValue::new(m.as_str(), positions as f64, "position_count", format!("{positions}P"))));
     }
 
@@ -240,9 +240,9 @@ pub fn extract_values(query: &str) -> (Vec<ExtractedValue>, String) {
         if overlaps(&extractions, m.start()) {
             continue;
         }
-        let rows: i64 = caps[1].parse().unwrap();
-        let pins_per_row: i64 = caps[2].parse().unwrap();
-        let total = rows * pins_per_row;
+        let rows: i64 = caps[1].parse().unwrap_or(i64::MAX);
+        let pins_per_row: i64 = caps[2].parse().unwrap_or(i64::MAX);
+        let total = rows.saturating_mul(pins_per_row);
         extractions.push((m.start(), m.end(), ExtractedValue::new(m.as_str(), total as f64, "pin_structure", format!("{rows}x{pins_per_row}P"))));
     }
 
@@ -459,5 +459,41 @@ mod tests {
         assert_eq!(values.len(), 1);
         approx(values[0].value, 2.0);
         assert_eq!(values[0].unit_type, "current");
+    }
+
+    #[test]
+    fn pin_count_pathologically_long_digits() {
+        // 25-digit number exceeds i64::MAX (which is 9223372036854775807, 19 digits)
+        // Parser should saturate to i64::MAX instead of panicking
+        let (values, _remaining) = extract_values("12345678901234567890123456 pin header");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].unit_type, "pin_count");
+        // The saturated value i64::MAX as f64
+        approx(values[0].value, i64::MAX as f64);
+        assert_eq!(values[0].normalized, "9223372036854775807P");
+    }
+
+    #[test]
+    fn position_count_pathologically_long_digits() {
+        // 25-digit number exceeds i64::MAX
+        // Parser should saturate to i64::MAX instead of panicking
+        let (values, _remaining) = extract_values("12345678901234567890123456 position connector");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].unit_type, "position_count");
+        // The saturated value i64::MAX as f64
+        approx(values[0].value, i64::MAX as f64);
+    }
+
+    #[test]
+    fn pin_structure_pathologically_long_digits() {
+        // PIN_STRUCTURE pattern matches ([12])\s*[xX]\s*(\d+)
+        // First group is constrained to [12], but second group can be pathologically long
+        // Parser should saturate to i64::MAX instead of panicking
+        let (values, _remaining) = extract_values("2x12345678901234567890123456 pin header");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].unit_type, "pin_structure");
+        // rows=2, pins_per_row saturates to i64::MAX, total = 2 * i64::MAX (wraps, but doesn't panic)
+        // The saturated multiplication doesn't panic because we're casting i64 to f64
+        assert!(values[0].value.is_finite());
     }
 }
