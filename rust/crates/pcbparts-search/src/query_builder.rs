@@ -289,9 +289,18 @@ pub fn build_spec_filter_clauses(spec_filters: &[SpecFilter]) -> (Vec<String>, V
                 if let Some((column_name, mut parser)) = column_info {
                     if parser.is_none() {
                         for name in &attr_names {
-                            if let Some(SpecParser::Parser(f)) = parsers.get(name.as_str()) {
-                                parser = Some(*f);
-                                break;
+                            match parsers.get(name.as_str()) {
+                                Some(SpecParser::Parser(f)) => {
+                                    parser = Some(*f);
+                                    break;
+                                }
+                                Some(SpecParser::Special) => {
+                                    panic!(
+                                        "'{name}' spec parser is 'special' (non-callable) — Python's build_spec_filter_clauses crashes the same way on this input (SPEC_PARSERS[name] == \"special\" is truthy but not callable); preserved faithfully per this plan's Task 4 instruction, not fixed here"
+                                    );
+                                }
+                                Some(SpecParser::StringMatch) => {}
+                                None => {}
                             }
                         }
                     }
@@ -317,9 +326,18 @@ pub fn build_spec_filter_clauses(spec_filters: &[SpecFilter]) -> (Vec<String>, V
                 if !handled {
                     let mut parser = None;
                     for name in &attr_names {
-                        if let Some(SpecParser::Parser(f)) = parsers.get(name.as_str()) {
-                            parser = Some(*f);
-                            break;
+                        match parsers.get(name.as_str()) {
+                            Some(SpecParser::Parser(f)) => {
+                                parser = Some(*f);
+                                break;
+                            }
+                            Some(SpecParser::Special) => {
+                                panic!(
+                                    "'{name}' spec parser is 'special' (non-callable) — Python's build_spec_filter_clauses crashes the same way on this input (SPEC_PARSERS[name] == \"special\" is truthy but not callable); preserved faithfully per this plan's Task 4 instruction, not fixed here"
+                                );
+                            }
+                            Some(SpecParser::StringMatch) => {}
+                            None => {}
                         }
                     }
                     let parsed_value = parser.and_then(|f| f(&spec_filter.value));
@@ -418,7 +436,18 @@ pub fn needs_numeric_post_filter(spec_filter: &SpecFilter) -> bool {
     }
     if spec_filter.operator == SpecOperator::Eq {
         let parsers = spec_parsers();
-        return attr_names.iter().any(|name| matches!(parsers.get(name.as_str()), Some(SpecParser::Parser(_))));
+        for name in &attr_names {
+            match parsers.get(name.as_str()) {
+                Some(SpecParser::Parser(_)) => return true,
+                Some(SpecParser::Special) => {
+                    panic!(
+                        "'{name}' spec parser is 'special' (non-callable) — Python's needs_numeric_post_filter returns True here since SPEC_PARSERS[name] is truthy; preserved faithfully per this plan's Task 4 instruction, not fixed here"
+                    );
+                }
+                Some(SpecParser::StringMatch) => {}
+                None => {}
+            }
+        }
     }
     false
 }
@@ -584,6 +613,16 @@ mod tests {
         let (sql, params, meta) = build_spec_filter_clauses(&filters);
         assert_eq!(sql, vec!["AND resistance_ohms >= ?"]);
         assert_eq!(params, vec![SqlParam::Real(10000.0)]);
+        assert_eq!(meta.len(), 0);
+    }
+
+    #[test]
+    fn test_build_spec_filter_clauses_resistance_numeric_column_eq_tolerance() {
+        let filters = vec![SpecFilter::new("Resistance", "=", "10k").unwrap()];
+        let (sql, params, meta) = build_spec_filter_clauses(&filters);
+        assert_eq!(sql, vec!["AND resistance_ohms BETWEEN ? AND ?"]);
+        // 10k = 10000 ohms, tolerance = 10000 * 0.01 = 100
+        assert_eq!(params, vec![SqlParam::Real(9900.0), SqlParam::Real(10100.0)]);
         assert_eq!(meta.len(), 0);
     }
 
