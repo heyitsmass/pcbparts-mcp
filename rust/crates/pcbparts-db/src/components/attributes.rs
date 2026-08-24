@@ -88,10 +88,18 @@ pub fn list_attributes(
         }
     }
 
+    // Bind once — spec_parsers() rebuilds a ~300-entry HashMap from scratch on every
+    // call, and the loop below would otherwise call it several times per attribute.
+    let parsers = spec_parsers();
+
     let aliases = attribute_aliases();
     let mut alias_lookup: HashMap<String, String> = HashMap::new();
     for (alias, full_names) in &aliases {
         for full_name in full_names {
+            // First-wins is safe only because no full attribute name currently appears
+            // under two different alias keys in ATTRIBUTE_ALIASES (verified separately).
+            // If that data ever changes, iteration order over this HashMap would make
+            // the winner non-deterministic and this would need a deterministic tie-break.
             alias_lookup.entry(full_name.to_string()).or_insert_with(|| alias.to_string());
         }
     }
@@ -104,18 +112,27 @@ pub fn list_attributes(
 
     let mut attributes = Vec::new();
     for (name, count) in sorted_names {
+        // Defaults to the attribute's own `name` (not Python's literal `""` default)
+        // when not found in alias_lookup. Behaviorally inert: the only downstream use
+        // is `aliases.get(alias_target)`, and if `name` isn't a key in alias_lookup it
+        // also can't be a valid key into `aliases` by construction — so the default is
+        // never actually used as a real lookup key in either language.
         let alias_target = alias_lookup.get(name).map(|s| s.as_str()).unwrap_or(name.as_str());
         let target_full_names: Vec<&str> = aliases.get(alias_target).cloned().unwrap_or_else(|| vec![name.as_str()]);
-        let condition = target_full_names.iter().any(|fname| spec_parsers().contains_key(fname));
+        let condition = target_full_names.iter().any(|fname| parsers.contains_key(fname));
         let is_numeric_by_alias = condition && aliases.values().any(|full_names| full_names.contains(&name.as_str()));
-        let mut is_numeric = spec_parsers().contains_key(name.as_str()) || is_numeric_by_alias;
+        let mut is_numeric = parsers.contains_key(name.as_str()) || is_numeric_by_alias;
 
+        // Same divergence as categories.rs::find_by_subcategory: Python's plain
+        // truthiness check on SPEC_PARSERS.get(name) treats the sentinel string
+        // "special" as truthy and crashes calling it as a function. Matching
+        // explicitly on SpecParser::Parser here excludes that case — intentional.
         let values = attr_values.get(name).cloned().unwrap_or_default();
-        let parser = match spec_parsers().get(name.as_str()) {
+        let parser = match parsers.get(name.as_str()) {
             Some(SpecParser::Parser(f)) => Some(*f),
             _ => alias_lookup.get(name).and_then(|alias| {
                 aliases.get(alias.as_str()).and_then(|targets| {
-                    targets.iter().find_map(|t| match spec_parsers().get(*t) {
+                    targets.iter().find_map(|t| match parsers.get(*t) {
                         Some(SpecParser::Parser(f)) => Some(*f),
                         _ => None,
                     })

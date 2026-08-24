@@ -60,6 +60,10 @@ pub fn find_by_subcategory(
     prefer_no_fee: bool,
     limit: i64,
 ) -> Vec<Value> {
+    // Bind once — spec_parsers() rebuilds a ~300-entry HashMap from scratch on every
+    // call, and this function may otherwise call it once per post-filtered row.
+    let parsers = spec_parsers();
+
     let mut sql_parts = vec!["SELECT * FROM components WHERE subcategory_id = ?".to_string()];
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(subcategory_id)];
 
@@ -78,12 +82,22 @@ pub fn find_by_subcategory(
         }
     }
 
+    // Python does `parser = SPEC_PARSERS.get(spec); if parser:` (plain truthiness).
+    // "Impedance @ Frequency" maps to the sentinel string "special", which is truthy
+    // in Python, so Python wrongly takes the numeric branch and crashes calling it as
+    // a function. Matching on `SpecParser::Parser` here correctly excludes that case —
+    // an intentional improvement over Python's crash, not an unintentional divergence.
     let is_numeric_spec = primary_spec
-        .map(|s| matches!(spec_parsers().get(s), Some(SpecParser::Parser(_))))
+        .map(|s| matches!(parsers.get(s), Some(SpecParser::Parser(_))))
         .unwrap_or(false);
     if let (Some(spec), Some(value)) = (primary_spec, primary_value) {
         if !is_numeric_spec {
             sql_parts.push("AND attributes LIKE ? ESCAPE '\\'".to_string());
+            // Intentionally mirrors Python's db/categories.py literal pattern (comma,
+            // no space) for parity. The real DB stores attribute pairs with a space
+            // after the comma (["name", "value"]), so this branch matches nothing
+            // against real data in either language — a preserved upstream Python
+            // quirk, not a bug to fix here.
             let pattern = format!("%\"{}\",\"{}\"%", escape_like(spec), escape_like(value));
             params.push(Box::new(pattern));
         }
@@ -106,7 +120,7 @@ pub fn find_by_subcategory(
     for part in rows.filter_map(|r| r.ok()) {
         if let (Some(spec), Some(value)) = (primary_spec, primary_value) {
             if is_numeric_spec {
-                if let Some(SpecParser::Parser(parser)) = spec_parsers().get(spec) {
+                if let Some(SpecParser::Parser(parser)) = parsers.get(spec) {
                     if let Some(target) = parser(value) {
                         let part_value = part.get("specs").and_then(|s| s.get(spec)).and_then(|v| v.as_str());
                         match part_value {

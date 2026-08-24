@@ -94,8 +94,6 @@ pub struct ComponentsDb {
     subcategories: BTreeMap<i64, SubcategoryInfo>,
     categories: BTreeMap<i64, CategoryInfo>,
     subcategory_name_to_id: HashMap<String, i64>,
-    category_name_to_id: HashMap<String, i64>,
-    category_to_subcategories: BTreeMap<i64, Vec<i64>>,
     search_engine: SearchEngine,
 }
 
@@ -141,8 +139,8 @@ impl ComponentsDb {
             subcategories.clone(),
             categories.clone(),
             subcategory_name_to_id.clone(),
-            category_name_to_id.clone(),
-            category_to_subcategories.clone(),
+            category_name_to_id,
+            category_to_subcategories,
         );
 
         Ok(Self {
@@ -150,8 +148,6 @@ impl ComponentsDb {
             subcategories,
             categories,
             subcategory_name_to_id,
-            category_name_to_id,
-            category_to_subcategories,
             search_engine,
         })
     }
@@ -426,6 +422,15 @@ mod tests {
         }
     }
 
+    // --- TestSingleLookup ---
+    #[test]
+    fn test_get_by_lcsc_returns_part() {
+        let db = real_db();
+        let result = db.get_by_lcsc("C1525");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()["lcsc"], "C1525");
+    }
+
     // --- TestBatchLookup ---
     #[test]
     fn test_batch_lookup_returns_all_parts() {
@@ -562,6 +567,17 @@ mod tests {
         // in Python's own source, but the function should still execute without error.)
         for part in &results {
             assert_eq!(part["subcategory_id"], resistor_id);
+        }
+    }
+
+    #[test]
+    fn test_find_by_subcategory_clamps_min_stock_silently() {
+        let db = real_db();
+        let mosfet_id = db.resolve_subcategory_name("MOSFETs").unwrap();
+        let results = db.find_by_subcategory(mosfet_id, None, None, 0, None, true, 20);
+        for part in &results {
+            let stock = part["stock"].as_i64().unwrap();
+            assert!(stock >= 10, "part {} has stock {stock}, expected clamp to DEFAULT_MIN_STOCK (10) even though min_stock=0 was requested", part["lcsc"]);
         }
     }
 
@@ -773,6 +789,24 @@ mod tests {
         let result = db.search(SearchArgs { limit: 10, ..search_args() });
         assert!(result.get("error").is_none());
         assert_eq!(result["filters_applied"]["prefer_no_fee"], true);
+    }
+
+    // --- TestMinStockClamp ---
+    #[test]
+    fn test_search_warns_when_min_stock_clamped() {
+        let db = real_db();
+        let result = db.search(SearchArgs { min_stock: 0, limit: 1, ..search_args() });
+        assert!(result.get("error").is_none());
+        let warning = result["warning"].as_str().expect("warning should be present when min_stock is clamped");
+        assert!(warning.contains("was increased to 10"), "warning text: {warning}");
+    }
+
+    #[test]
+    fn test_search_no_warning_when_min_stock_not_clamped() {
+        let db = real_db();
+        let result = db.search(SearchArgs { min_stock: 50, limit: 1, ..search_args() });
+        assert!(result.get("error").is_none());
+        assert!(result.get("warning").is_none(), "no warning expected when min_stock already exceeds the default");
     }
 
     #[test]
