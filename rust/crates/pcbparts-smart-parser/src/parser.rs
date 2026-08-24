@@ -52,6 +52,16 @@ fn values_to_json(values: &[ExtractedValue]) -> serde_json::Value {
     )
 }
 
+/// Mirrors Python's `detected.setdefault("semantic", []).append(text)` idiom.
+fn push_semantic(detected: &mut serde_json::Map<String, serde_json::Value>, text: impl Into<String>) {
+    detected
+        .entry("semantic")
+        .or_insert_with(|| serde_json::Value::Array(vec![]))
+        .as_array_mut()
+        .expect("detected[\"semantic\"] is always inserted as an Array")
+        .push(serde_json::Value::String(text.into()));
+}
+
 /// Parse a natural language query into structured filters.
 pub fn parse_smart_query(query: &str) -> ParsedQuery {
     let mut detected = serde_json::Map::new();
@@ -127,12 +137,16 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
             let kw_lower = kw.to_lowercase();
             if kw_lower.contains("n-channel") || kw_lower == "nmos" {
                 result.spec_filters.push(SpecFilter::new("Type", "=", "N-Channel").expect("valid operator literal"));
+                push_semantic(&mut detected, "n-channel (from keyword)");
             } else if kw_lower.contains("p-channel") || kw_lower == "pmos" {
                 result.spec_filters.push(SpecFilter::new("Type", "=", "P-Channel").expect("valid operator literal"));
+                push_semantic(&mut detected, "p-channel (from keyword)");
             } else if kw_lower == "npn" || kw_lower == "npn transistor" {
                 result.spec_filters.push(SpecFilter::new("Type", "=", "NPN").expect("valid operator literal"));
+                push_semantic(&mut detected, "npn (from keyword)");
             } else if kw_lower == "pnp" || kw_lower == "pnp transistor" {
                 result.spec_filters.push(SpecFilter::new("Type", "=", "PNP").expect("valid operator literal"));
+                push_semantic(&mut detected, "pnp (from keyword)");
             }
         }
 
@@ -140,6 +154,7 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
         if subcat.to_lowercase() == "aluminum electrolytic capacitors - smd" && RADIAL_LEADED_RE.is_match(&remaining) {
             result.subcategory = Some("aluminum electrolytic capacitors - leaded".to_string());
             detected.insert("subcategory".into(), serde_json::json!("aluminum electrolytic capacitors - leaded"));
+            push_semantic(&mut detected, "radial/through-hole (leaded)");
             remaining = RADIAL_LEADED_RE.replace_all(&remaining, "").trim().to_string();
             remaining = WHITESPACE_RE.replace_all(&remaining, " ").to_string();
         }
@@ -213,6 +228,7 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
         if overridable {
             result.subcategory = Some("potentiometers, variable resistors".to_string());
             detected.insert("subcategory".into(), serde_json::json!("potentiometers, variable resistors"));
+            push_semantic(&mut detected, "potentiometer/trimmer (from keyword)");
             remaining = TRIMMER_RE.replace_all(&remaining, "").trim().to_string();
             remaining = WHITESPACE_RE.replace_all(&remaining, " ").to_string();
         }
@@ -232,6 +248,18 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
                         unit_type: "resistance".to_string(),
                         normalized: format!("{num_val}Ohm"),
                     });
+                    // NOTE: intentional asymmetry — `detected["values"]` records this as
+                    // "impedance" while the underlying `ExtractedValue.unit_type` stays
+                    // "resistance" (it maps to the "Impedance @ Frequency" spec via
+                    // `category_attribute_map`). Matches Python parser.py:216-220
+                    // exactly; do not "fix" this asymmetry.
+                    detected
+                        .entry("values")
+                        .or_insert_with(|| serde_json::Value::Array(vec![]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"raw": m.as_str(), "type": "impedance", "normalized": format!("{num_val}Ohm")}));
+                    push_semantic(&mut detected, format!("impedance={num_val}Ω (from standalone number)"));
                     remaining = format!("{}{}", &remaining[..m.start()], &remaining[m.end()..]);
                     remaining = WHITESPACE_RE.replace_all(remaining.trim(), " ").to_string();
                 }
@@ -242,12 +270,22 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
     // Step 5: extract semantic descriptors.
     let (semantic_filters, after_semantic) = extract_semantic_descriptors(&remaining);
     remaining = after_semantic;
+    // NOTE: this ASSIGNS (overwrites), it does not append — matches Python parser.py:229
+    // exactly (`detected["semantic"] = [...]`), which wipes any "semantic" entries added
+    // by earlier steps whenever a semantic descriptor is present. This quirk is
+    // intentional/load-bearing; do not change to an append.
+    if !semantic_filters.is_empty() {
+        detected.insert(
+            "semantic".into(),
+            serde_json::Value::Array(semantic_filters.iter().map(|f| serde_json::Value::String(f.source.clone())).collect()),
+        );
+    }
 
-    // Step 6: build spec filters from extracted values (category-aware).
-    // `map_value_to_spec` and the connector text-cleanup checks below read the LOCAL
-    // `subcategory` binding (its Step-3 snapshot) — NOT `result.subcategory`, which
-    // Steps 4b/4c may have since reassigned. This distinction is load-bearing; see
-    // Global Constraints.
+    // Step 6: build spec filters from extracted values (category-aware). The
+    // dimension-as-package and connector-skip checks just below correctly use
+    // `result.subcategory` (current, post Steps 4b/4c) — contrast with the
+    // `map_value_to_spec` call further down, which deliberately reads the LOCAL
+    // `subcategory` binding instead (see the NOTE directly above that call).
     let subcat_lower = result.subcategory.clone().unwrap_or_default().to_lowercase();
 
     for value in &values {
@@ -268,6 +306,9 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
             continue;
         }
 
+        // NOTE: reads the LOCAL `subcategory` binding (its Step-3 snapshot) — NOT
+        // `result.subcategory`, which Steps 4b/4c may have since reassigned. This
+        // distinction is load-bearing; see Global Constraints.
         let (spec_name, operator) = map_value_to_spec(value, subcategory.as_deref(), matched_keyword.as_deref());
         result.spec_filters.push(SpecFilter::new(spec_name, operator, value.normalized.clone()).expect("valid operator literal"));
     }
@@ -286,6 +327,7 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
             .map(|sf| sf.value.clone());
         if let Some(ct) = channel_type {
             result.spec_filters.push(SpecFilter::new("Number", "=", format!("2 {ct}")).expect("valid operator literal"));
+            push_semantic(&mut detected, format!("dual (-> Number=2 {ct})"));
         }
         remaining = DUAL_RE.replace_all(&remaining, "").trim().to_string();
         remaining = WHITESPACE_RE.replace_all(&remaining, " ").to_string();
@@ -300,7 +342,9 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
             if sf.name == "Number of Pins" && sf.value.ends_with('P') {
                 let pin_count = &sf.value[..sf.value.len() - 1];
                 if !pin_count.is_empty() && pin_count.chars().all(|c| c.is_ascii_digit()) {
+                    let pin_count = pin_count.to_string();
                     *sf = SpecFilter::new("Pin Structure", "=", format!("1x{pin_count}P")).expect("valid operator literal");
+                    push_semantic(&mut detected, format!("single row (-> Pin Structure=1x{pin_count}P)"));
                 }
             }
         }
@@ -312,9 +356,15 @@ pub fn parse_smart_query(query: &str) -> ParsedQuery {
         for sf in result.spec_filters.iter_mut() {
             if sf.name == "Number of Pins" && sf.value.ends_with('P') {
                 let pin_count_str = &sf.value[..sf.value.len() - 1];
-                if let Ok(total) = pin_count_str.parse::<i64>() {
-                    let pins_per_row = if total % 2 == 0 { total / 2 } else { total };
-                    *sf = SpecFilter::new("Pin Structure", "=", format!("2x{pins_per_row}P")).expect("valid operator literal");
+                // Stricter than a bare `.parse::<i64>()`, matching Python's `.isdigit()`
+                // (which rejects `+`/`-` signs) — same style as the single-row branch
+                // above (final-review-report.md finding #9).
+                if !pin_count_str.is_empty() && pin_count_str.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(total) = pin_count_str.parse::<i64>() {
+                        let pins_per_row = if total % 2 == 0 { total / 2 } else { total };
+                        *sf = SpecFilter::new("Pin Structure", "=", format!("2x{pins_per_row}P")).expect("valid operator literal");
+                        push_semantic(&mut detected, format!("double row (-> Pin Structure=2x{pins_per_row}P)"));
+                    }
                 }
             }
         }
@@ -666,6 +716,108 @@ mod tests {
         let r = parse_smart_query("CSP100");
         assert_eq!(r.package.as_deref(), Some("CSP100"));
         assert_eq!(r.model_number, None);
+    }
+
+    // --- detected["semantic"] / detected["values"] parity (final-review-report.md
+    // findings #2 and #3) — captured from the live Python `parse_smart_query`. ---
+    #[test]
+    fn detected_semantic_populated_for_keyword_type_filters() {
+        for (query, expected_type_value, expected_semantic) in [
+            ("n-channel mosfet", "N-Channel", "n-channel (from keyword)"),
+            ("p-channel mosfet", "P-Channel", "p-channel (from keyword)"),
+            ("npn transistor", "NPN", "npn (from keyword)"),
+            ("pnp transistor", "PNP", "pnp (from keyword)"),
+        ] {
+            let r = parse_smart_query(query);
+            assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!([expected_semantic])), "query: {query}");
+            assert!(
+                r.spec_filters.iter().any(|f| f.name == "Type" && f.value == expected_type_value),
+                "query: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn detected_semantic_step5_assign_overwrites_step3_append() {
+        // Step 5 (parser.py:229) ASSIGNS `detected["semantic"]`, not append — wiping
+        // the "n-channel (from keyword)" entry Step 3 added, whenever a semantic
+        // descriptor is also present.
+        let r = parse_smart_query("n-channel mosfet low Vgs");
+        assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!(["low vgs"])));
+
+        // Without a semantic descriptor present, Step 5's `if semantic_filters:` guard
+        // never fires, so the Step 3 entry survives untouched.
+        let r = parse_smart_query("n-channel mosfet");
+        assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!(["n-channel (from keyword)"])));
+    }
+
+    #[test]
+    fn detected_values_impedance_entry_for_ferrite_bead() {
+        // detected["values"]'s impedance entry intentionally says "type": "impedance"
+        // even though the underlying ExtractedValue.unit_type is "resistance" (finding
+        // #3) — do not "fix" this asymmetry.
+        let r = parse_smart_query("ferrite bead 0603 30");
+        assert_eq!(r.subcategory.as_deref(), Some("ferrite beads"));
+        let values = r.detected.get("values").and_then(|v| v.as_array()).expect("detected[\"values\"] present");
+        let impedance_entry = values
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("impedance"))
+            .expect("impedance entry in detected[\"values\"]");
+        assert_eq!(impedance_entry.get("raw").and_then(|v| v.as_str()), Some("30"));
+        assert_eq!(impedance_entry.get("normalized").and_then(|v| v.as_str()), Some("30Ohm"));
+        assert_eq!(
+            r.detected.get("semantic"),
+            Some(&serde_json::json!(["impedance=30\u{03a9} (from standalone number)"]))
+        );
+    }
+
+    #[test]
+    fn detected_semantic_dual_mosfet_and_header_row_structure() {
+        let r = parse_smart_query("dual n-channel mosfet");
+        assert_eq!(
+            r.detected.get("semantic"),
+            Some(&serde_json::json!(["n-channel (from keyword)", "dual (-> Number=2 N-Channel)"]))
+        );
+
+        let r = parse_smart_query("16 pin header single row");
+        assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!(["single row (-> Pin Structure=1x16P)"])));
+
+        let r = parse_smart_query("16 pin header double row");
+        assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!(["double row (-> Pin Structure=2x8P)"])));
+    }
+
+    #[test]
+    fn detected_semantic_trimmer_override_and_electrolytic_leaded() {
+        let r = parse_smart_query("10k resistor trimmer");
+        assert_eq!(r.subcategory.as_deref(), Some("potentiometers, variable resistors"));
+        assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!(["potentiometer/trimmer (from keyword)"])));
+
+        let r = parse_smart_query("electrolytic capacitor 100uF radial");
+        assert_eq!(r.subcategory.as_deref(), Some("aluminum electrolytic capacitors - leaded"));
+        assert_eq!(r.detected.get("semantic"), Some(&serde_json::json!(["radial/through-hole (leaded)"])));
+    }
+
+    #[test]
+    fn parse_smart_query_batch_is_fast_when_precompiled() {
+        // Regression guard: parse_smart_query calls into extract_component_type
+        // (finding #1) and map_value_to_spec (finding #6), both fixed from per-call
+        // regex/HashMap-rebuild regressions in this fix round (measured 16.4ms/call vs
+        // Python's 0.365ms/call before the fix). `cargo test` runs unoptimized by
+        // default, so this bound is calibrated generously against debug-mode reality
+        // (measured ~300-330µs/call here) rather than release-mode cache-hit cost: a
+        // reintroduction of the per-call-rebuild bug would cost many *seconds* for 500
+        // calls even in an optimized build, so 2s total gives large margin on both sides
+        // without being flaky under CI/debug-build slowness.
+        let start = std::time::Instant::now();
+        for _ in 0..500 {
+            let _ = parse_smart_query("10k resistor 0603 1% low power n-channel mosfet ferrite bead");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "500 calls to parse_smart_query took {elapsed:?}, expected well under 2s \
+             (regex/HashMap rebuild-per-call regression?)"
+        );
     }
 
     // --- merge_spec_filters: zero pytest coverage, characterization only ---

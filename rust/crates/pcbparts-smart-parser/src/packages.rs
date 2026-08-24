@@ -56,37 +56,46 @@ fn find_diode_pkg(query: &str) -> Option<regex::Match<'_>> {
     DIODE_PKG_RE.find_iter(query).find(|m| !FOLLOWED_BY_CONNECTOR_RE.is_match(&query[m.end()..]))
 }
 
+/// A package-matcher entry: a finder function plus its `kind` label. Aliased to silence
+/// `clippy::type_complexity` on the `PACKAGE_PATTERNS` array type below.
+type PackagePatternFinder = fn(&str) -> Option<regex::Match<'_>>;
+type PackagePatternEntry = (PackagePatternFinder, &'static str);
+
+/// Precompiled package-matcher table, in match-priority order (order is load-bearing —
+/// e.g. TSSOP must be checked before SOP, and SOP before SO). Rust equivalent of
+/// Python's `PACKAGE_PATTERNS: list[tuple[re.Pattern[str], str]]` module-level list,
+/// re-exported at the crate root for `__all__` parity (final-review-report.md finding
+/// #4). Every pattern has exactly one capturing group whose span equals the whole match
+/// (each regex is `\b(...)\b` with nothing captured outside the group), so `m.as_str()`
+/// on the whole-match `Match` is always the captured package text — no separate
+/// `.captures()` call is needed.
+pub static PACKAGE_PATTERNS: [PackagePatternEntry; 19] = [
+    (|q| IMPERIAL_RE.find(q), "imperial"),
+    (|q| SMD_METRIC_RE.find(q), "smd_metric"),
+    (|q| METRIC_RE.find(q), "metric"),
+    (|q| SOT_RE.find(q), "sot"),
+    (|q| SOD_RE.find(q), "sod"),
+    (|q| DO_RE.find(q), "do"),
+    (|q| TO_RE.find(q), "to"),
+    (|q| QFN_RE.find(q), "qfn"),
+    (|q| QFP_RE.find(q), "qfp"),
+    (|q| BGA_RE.find(q), "bga"),
+    (|q| CSP_RE.find(q), "csp"),
+    (|q| DIP_RE.find(q), "dip"),
+    (|q| TSSOP_RE.find(q), "tssop"),
+    (|q| SOP_RE.find(q), "sop"),
+    (|q| SO_RE.find(q), "so"),
+    (|q| MODULE_RE.find(q), "module"),
+    (find_diode_pkg, "diode_pkg"),
+    (|q| MXX_DIODE_PKG_RE.find(q), "mxx_diode_pkg"),
+    (|q| USB_RE.find(q), "usb"),
+];
+
 /// Extract package from `query`. Returns `(package, remaining_query,
 /// suggested_subcategory)` — `suggested_subcategory` is used for USB-C etc. where the
 /// package pattern implies a component type rather than a literal package name.
 pub fn extract_package(query: &str) -> (Option<String>, String, Option<String>) {
-    // Every pattern below has exactly one capturing group whose span equals the whole
-    // match (each pattern is `\b(...)\b` with nothing captured outside the group), so
-    // `m.as_str()` on the whole-match `Match` is always the captured package text —
-    // no separate `.captures()` call is needed.
-    let candidates: [(fn(&str) -> Option<regex::Match<'_>>, &str); 19] = [
-        (|q| IMPERIAL_RE.find(q), "imperial"),
-        (|q| SMD_METRIC_RE.find(q), "smd_metric"),
-        (|q| METRIC_RE.find(q), "metric"),
-        (|q| SOT_RE.find(q), "sot"),
-        (|q| SOD_RE.find(q), "sod"),
-        (|q| DO_RE.find(q), "do"),
-        (|q| TO_RE.find(q), "to"),
-        (|q| QFN_RE.find(q), "qfn"),
-        (|q| QFP_RE.find(q), "qfp"),
-        (|q| BGA_RE.find(q), "bga"),
-        (|q| CSP_RE.find(q), "csp"),
-        (|q| DIP_RE.find(q), "dip"),
-        (|q| TSSOP_RE.find(q), "tssop"),
-        (|q| SOP_RE.find(q), "sop"),
-        (|q| SO_RE.find(q), "so"),
-        (|q| MODULE_RE.find(q), "module"),
-        (find_diode_pkg, "diode_pkg"),
-        (|q| MXX_DIODE_PKG_RE.find(q), "mxx_diode_pkg"),
-        (|q| USB_RE.find(q), "usb"),
-    ];
-
-    for (find_fn, kind) in candidates {
+    for (find_fn, kind) in PACKAGE_PATTERNS {
         if let Some(m) = find_fn(query) {
             return finish_package_match(query, m, kind);
         }

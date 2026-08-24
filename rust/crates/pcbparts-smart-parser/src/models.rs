@@ -1,7 +1,9 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-static MODEL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+/// Re-exported at the crate root for `__all__` parity with Python's `MODEL_PATTERNS`
+/// module-level list (final-review-report.md finding #4).
+pub static MODEL_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         // ESP32 compound module names must come first so the full compound name
         // (e.g. "ESP32-S3-MINI-1") matches before the generic pattern below truncates it.

@@ -2,15 +2,35 @@ use pcbparts_parsers::subcategory_aliases::subcategory_aliases;
 use regex::Regex;
 use std::sync::LazyLock;
 
-// Pre-sorted by length (longest first) for correct matching — a stable sort, matching
-// Python's `sorted(SUBCATEGORY_ALIASES.keys(), key=len, reverse=True)`.
-static SUBCATEGORY_KEYWORDS_BY_LENGTH: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let mut keys: Vec<&'static str> = subcategory_aliases().into_keys().collect();
+// Precompiled once (keyword regex, keyword text, mapped subcategory), pre-sorted by
+// length (longest first) for correct matching — a stable sort, matching Python's
+// `sorted(SUBCATEGORY_ALIASES.keys(), key=len, reverse=True)`. Same pattern as
+// `semantic.rs`'s `SORTED_DESCRIPTORS`: compiling every keyword's regex and rebuilding
+// the alias HashMap on every call was a 45x perf regression vs Python (see
+// final-review-report.md finding #1) — both are now built once at first use.
+static SUBCATEGORY_KEYWORD_PATTERNS: LazyLock<Vec<(Regex, &'static str, &'static str)>> = LazyLock::new(|| {
+    let aliases = subcategory_aliases();
+    let mut keys: Vec<&'static str> = aliases.keys().copied().collect();
     // Sort by length (descending), then alphabetically (ascending) as tiebreak.
     // HashMap iteration order is not stable across process runs, so a deterministic
-    // secondary sort key (lexicographic string comparison) is required for reproducible behavior.
+    // secondary sort key (lexicographic string comparison) is required for reproducible
+    // behavior.
+    //
+    // NOTE: like `pcbparts-parsers/src/subcategory_aliases.rs:456-458`'s
+    // `find_subcategory_id` tiebreak, this alphabetical tiebreak intentionally diverges
+    // from Python's insertion-order tiebreak for equal-length keyword ties (e.g. "diode
+    // boost": Python picks "diode" -> "switching diodes" by insertion order, this picks
+    // "boost" -> "dc-dc converters" alphabetically). See final-review-report.md finding
+    // #5 (PARKED) — a cross-crate ordered-accessor fix to reproduce Python's tiebreak
+    // exactly was ruled out of scope for this fix round.
     keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    keys
+    keys.into_iter()
+        .map(|keyword| {
+            // Word boundaries avoid "sram" matching inside "PSRAM".
+            let pattern = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(keyword))).unwrap();
+            (pattern, keyword, aliases[keyword])
+        })
+        .collect()
 });
 
 static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
@@ -19,15 +39,12 @@ static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwr
 /// matched_keyword)`.
 pub fn extract_component_type(query: &str) -> (Option<String>, String, Option<String>) {
     let query_lower = query.to_lowercase();
-    let aliases = subcategory_aliases();
 
-    for &keyword in SUBCATEGORY_KEYWORDS_BY_LENGTH.iter() {
-        // Word boundaries avoid "sram" matching inside "PSRAM".
-        let pattern = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(keyword))).unwrap();
+    for (pattern, keyword, subcategory) in SUBCATEGORY_KEYWORD_PATTERNS.iter() {
         if pattern.is_match(&query_lower) {
             let remaining = pattern.replace_all(query, "").trim().to_string();
             let remaining = WHITESPACE_RE.replace_all(&remaining, " ").to_string();
-            return (Some(aliases[keyword].to_string()), remaining, Some(keyword.to_string()));
+            return (Some(subcategory.to_string()), remaining, Some(keyword.to_string()));
         }
     }
 
@@ -131,6 +148,44 @@ mod tests {
             result1.2,
             Some("cap".to_string()),
             "deterministic tiebreak should match 'cap' before 'pot' alphabetically"
+        );
+    }
+
+    #[test]
+    fn tiebreak_diverges_from_python_insertion_order_by_design() {
+        // "diode" and "boost" are both length-5 keywords that collide in the
+        // length-bucket sort. Python's insertion-order tiebreak picks "diode"
+        // (declared earlier in subcategory_aliases.rs) -> "switching diodes".
+        // Verified against the live Python `parse_smart_query("diode boost")`.
+        // This crate's deterministic alphabetical tiebreak instead picks "boost"
+        // (alphabetically first) -> "dc-dc converters". This is an intentional,
+        // documented divergence from Python (final-review-report.md finding #5,
+        // PARKED) — pinning the *chosen* alphabetical behavior here so a future
+        // change can't silently flip it back without review.
+        let (subcat, _remaining, kw) = extract_component_type("diode boost");
+        assert_eq!(kw, Some("boost".to_string()));
+        assert_eq!(subcat, Some("dc-dc converters".to_string()));
+    }
+
+    #[test]
+    fn extract_component_type_is_fast_when_precompiled() {
+        // Regression guard for finding #1 (measured 45x perf regression in release mode
+        // from rebuilding the ~370-entry keyword regex list + alias HashMap on every
+        // call — 16.1ms/call vs 0.365ms/call). `cargo test` runs unoptimized by default,
+        // so this bound is calibrated generously against debug-mode reality (measured
+        // ~150-300µs/call here) rather than release-mode cache-hit cost: a
+        // reintroduction of the per-call-rebuild bug would cost many *seconds* for 500
+        // calls even in an optimized build, so 2s total gives large margin on both sides
+        // without being flaky under CI/debug-build slowness.
+        let start = std::time::Instant::now();
+        for _ in 0..500 {
+            let _ = extract_component_type("10k resistor 0603 1% low power");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "500 calls to extract_component_type took {elapsed:?}, expected well under 2s \
+             (regex/HashMap rebuild-per-call regression?)"
         );
     }
 }

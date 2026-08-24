@@ -1,5 +1,14 @@
 use crate::values::ExtractedValue;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+/// Precompiled once at first use, built by calling `category_attribute_map()` a single
+/// time — rebuilding this ~60-entry nested HashMap on every `map_value_to_spec` call was
+/// a 6.8µs/call regression vs ~50ns for a cached lookup (final-review-report.md finding
+/// #6), same bug class as finding #1. `category_attribute_map()` itself remains public
+/// for API parity with Python's `CATEGORY_ATTRIBUTE_MAP` constant.
+static CATEGORY_ATTRIBUTE_MAP: LazyLock<HashMap<&'static str, HashMap<&'static str, &'static str>>> =
+    LazyLock::new(category_attribute_map);
 
 /// Maps (category_keyword, value_type) -> spec_name, so a bare "voltage" value maps to
 /// "Vds" for MOSFETs, "Vr" for diodes, "Output Voltage" for regulators, etc.
@@ -112,6 +121,10 @@ const NUMERIC_LIKE_UNIT_TYPES: &[&str] = &[
     "pin_count", "position_count", "pin_structure", "pitch",
 ];
 
+/// Precompiled once — see `CATEGORY_ATTRIBUTE_MAP` above; same 45x-regression bug class
+/// as finding #1, fixed in the same pass (final-review-report.md finding #6).
+static DEFAULT_SPECS: LazyLock<HashMap<&'static str, (&'static str, &'static str)>> = LazyLock::new(default_specs);
+
 fn default_specs() -> HashMap<&'static str, (&'static str, &'static str)> {
     HashMap::from([
         ("voltage", ("Voltage Rating", ">=")),
@@ -159,21 +172,17 @@ pub fn map_value_to_spec(
     component_type: Option<&str>,
     matched_keyword: Option<&str>,
 ) -> (String, &'static str) {
-    let cat_map = category_attribute_map();
-
-    for candidate in [matched_keyword, component_type] {
-        if let Some(kw) = candidate {
-            let kw_lower = kw.to_lowercase();
-            if let Some(entry) = cat_map.get(kw_lower.as_str()) {
-                if let Some(&spec_name) = entry.get(value.unit_type.as_str()) {
-                    let op = if NUMERIC_LIKE_UNIT_TYPES.contains(&value.unit_type.as_str()) { "=" } else { ">=" };
-                    return (spec_name.to_string(), op);
-                }
+    for kw in [matched_keyword, component_type].into_iter().flatten() {
+        let kw_lower = kw.to_lowercase();
+        if let Some(entry) = CATEGORY_ATTRIBUTE_MAP.get(kw_lower.as_str()) {
+            if let Some(&spec_name) = entry.get(value.unit_type.as_str()) {
+                let op = if NUMERIC_LIKE_UNIT_TYPES.contains(&value.unit_type.as_str()) { "=" } else { ">=" };
+                return (spec_name.to_string(), op);
             }
         }
     }
 
-    if let Some(&(spec_name, op)) = default_specs().get(value.unit_type.as_str()) {
+    if let Some(&(spec_name, op)) = DEFAULT_SPECS.get(value.unit_type.as_str()) {
         return (spec_name.to_string(), op);
     }
 
