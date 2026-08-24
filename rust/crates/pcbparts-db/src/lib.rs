@@ -1,4 +1,5 @@
 pub mod boards;
+pub mod components;
 pub mod sensor;
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use rusqlite::Row;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
 pub struct SubcategoryInfo {
     pub name: String,
     pub category_id: i64,

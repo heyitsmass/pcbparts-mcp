@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 
+#[derive(Clone)]
 pub struct CategoryInfo {
     pub name: String,
 }
